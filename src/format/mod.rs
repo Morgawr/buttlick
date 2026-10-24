@@ -5,6 +5,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::error::{ButtlickError, Result};
 use crate::format::header::{
@@ -172,17 +173,28 @@ impl GrammarDag {
         let mut writer = ChecksumWriter::new(buf_writer, payload_size);
         writer.write_payload(&header.to_bytes())?;
         writer.write_payload(&roots_buf)?;
-        let mut chunk_buf = Vec::with_capacity(64 * 1024);
-        for node in &self.rules {
-            let packed = PackedRuleNode::from_rule_node(node);
-            chunk_buf.extend_from_slice(&packed.to_bytes());
-            if chunk_buf.len() >= 64 * 1024 {
-                writer.write_payload(&chunk_buf)?;
-                chunk_buf.clear();
+        const BATCH_RULES: usize = 2_097_152;
+        let mut chunk_buf = vec![0u8; self.rules.len().min(BATCH_RULES) * PACKED_RULE_SIZE];
+        for rules_batch in self.rules.chunks(BATCH_RULES) {
+            let byte_len = rules_batch.len() * PACKED_RULE_SIZE;
+            let dst_slice = &mut chunk_buf[..byte_len];
+            if rules_batch.len() >= 16_384 {
+                dst_slice
+                    .par_chunks_mut(4096 * PACKED_RULE_SIZE)
+                    .zip(rules_batch.par_chunks(4096))
+                    .for_each(|(dst_chunk, node_chunk)| {
+                        for (dst, node) in dst_chunk.chunks_exact_mut(8).zip(node_chunk.iter()) {
+                            let packed = PackedRuleNode::from_rule_node(node);
+                            dst.copy_from_slice(&packed.to_bytes());
+                        }
+                    });
+            } else {
+                for (dst, node) in dst_slice.chunks_exact_mut(8).zip(rules_batch.iter()) {
+                    let packed = PackedRuleNode::from_rule_node(node);
+                    dst.copy_from_slice(&packed.to_bytes());
+                }
             }
-        }
-        if !chunk_buf.is_empty() {
-            writer.write_payload(&chunk_buf)?;
+            writer.write_payload(dst_slice)?;
         }
         let _ = writer.finish_and_write_footer()?;
         Ok(())

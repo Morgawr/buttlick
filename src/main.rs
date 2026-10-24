@@ -14,7 +14,7 @@ use buttlick::grammar::GrammarDag;
 
 const BINARY_MEDIA_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "mp3", "ogg", "wav", "flac", "mp4", "mkv",
-    "avi", "mov", "zip", "gz", "xz", "zst", "7z", "rar", "tar", "iso", "bin",
+    "avi", "mov", "zip", "gz", "xz", "zst", "7z", "rar", "tar", "iso", "bin", "btlk",
 ];
 
 fn should_include_file(path: &Path, text_only: bool, exclude_exts: &[String]) -> bool {
@@ -24,6 +24,9 @@ fn should_include_file(path: &Path, text_only: bool, exclude_exts: &[String]) ->
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
+    if ext == "btlk" {
+        return false;
+    }
     if exclude_exts.iter().any(|x| x.eq_ignore_ascii_case(&ext)) {
         return false;
     }
@@ -39,21 +42,27 @@ fn collect_input_files(
     text_only: bool,
     exclude_exts: &[String],
 ) -> Result<Vec<(String, PathBuf, u64)>> {
-    let mut out = Vec::new();
+    let mut raw_paths: Vec<(String, PathBuf)> = Vec::new();
     for input in inputs {
         if input.is_dir() {
             let base = input.parent().unwrap_or_else(|| Path::new(""));
-            collect_dir_recursive(base, input, text_only, exclude_exts, &mut out)?;
+            collect_dir_recursive(base, input, text_only, exclude_exts, &mut raw_paths)?;
         } else if should_include_file(input, text_only, exclude_exts) {
-            let meta = fs::metadata(input)?;
             let name = input
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| input.to_string_lossy().into_owned());
-            out.push((name, input.clone(), meta.len()));
+            raw_paths.push((name, input.clone()));
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    raw_paths.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let out: Vec<(String, PathBuf, u64)> = raw_paths
+        .into_par_iter()
+        .map(|(name, path)| {
+            let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            (name, path, len)
+        })
+        .collect();
     Ok(out)
 }
 
@@ -62,22 +71,20 @@ fn collect_dir_recursive(
     dir: &Path,
     text_only: bool,
     exclude_exts: &[String],
-    out: &mut Vec<(String, PathBuf, u64)>,
+    out: &mut Vec<(String, PathBuf)>,
 ) -> Result<()> {
-    let mut entries: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        entries.push(entry.path());
-    }
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if ft.is_dir() {
             collect_dir_recursive(base, &path, text_only, exclude_exts, out)?;
-        } else if path.is_file() && should_include_file(&path, text_only, exclude_exts) {
-            let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        } else if ft.is_file() && should_include_file(&path, text_only, exclude_exts) {
             let rel = path.strip_prefix(base).unwrap_or(&path);
             let name = rel.to_string_lossy().replace('\\', "/");
-            out.push((name, path, len));
+            out.push((name, path));
         }
     }
     Ok(())
@@ -386,10 +393,10 @@ fn run() -> Result<()> {
             const STREAM_BATCH_BYTES: u64 = 64 * 1024 * 1024;
             let mut dag = GrammarDag::new();
             if total_bytes > 1024 * 1024 {
-                let est_rules = (total_bytes as usize / 16).min(40_000_000);
+                let est_rules = (total_bytes as usize / 10).min(180_000_000);
                 dag.rules.reserve(est_rules);
                 dag.interner = buttlick::grammar::builder::RuleInterner::with_capacity(
-                    est_rules.clamp(65_536, 7_500_000),
+                    est_rules.clamp(65_536, 2_000_000),
                 );
             }
             let mut idx = 0usize;
@@ -430,6 +437,7 @@ fn run() -> Result<()> {
 
                 // Compress all chunks across the batch in parallel across all CPU cores
                 dag.add_documents_parallel(&loaded_batch);
+                loaded_batch.into_par_iter().for_each(drop);
                 dag.interner.trim_for_next_batch(&dag.rules);
                 processed_bytes += batch_bytes;
 
@@ -450,19 +458,25 @@ fn run() -> Result<()> {
             dag.save_to_path(&output)?;
 
             if stats {
-                let file_len = fs::metadata(&output).map(|m| m.len()).ok();
-                let rep = dag.inspect_report(file_len);
+                let archive_bytes = fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+                let total_uncompressed = dag.total_uncompressed_bytes();
+                let ratio = if archive_bytes > 0 {
+                    (total_uncompressed as f64) / (archive_bytes as f64)
+                } else {
+                    1.0
+                };
                 println!(
                     "Compressed {} document(s) ({} bytes) -> {} ({} bytes, {:.2}x ratio, {} rules, height {})",
-                    rep.num_roots,
-                    rep.total_uncompressed_bytes,
+                    dag.roots.len(),
+                    total_uncompressed,
                     output.display(),
-                    rep.archive_bytes,
-                    rep.compression_ratio,
-                    rep.num_rules,
-                    rep.max_height
+                    archive_bytes,
+                    ratio,
+                    dag.rules.len(),
+                    dag.max_height()
                 );
             }
+            std::mem::forget(dag);
         }
 
         Commands::Decompress {

@@ -2,11 +2,16 @@ use rustc_hash::FxHashMap;
 
 use crate::grammar::{RuleKind, RuleNode, SymbolId};
 
+pub const LINE_CACHE_SIZE: usize = 1 << 20;
+pub const LINE_CACHE_MASK: usize = LINE_CACHE_SIZE - 1;
+pub const SEEN_TABLE_SIZE: usize = 1 << 21;
+pub const SEEN_TABLE_MASK: usize = SEEN_TABLE_SIZE - 1;
+
 /// Returns true if a `Pair` rule should be indexed in the global cross-chunk hash-consing table
 /// during bulk streaming ingestion.
 #[inline(always)]
 pub const fn should_intern_pair_globally(node: &RuleNode) -> bool {
-    node.byte_len <= 32
+    node.byte_len <= 16 || (node.byte_len <= 28 && node.last_byte != b'\n')
 }
 
 /// Canonical hash-consing table ensuring structural deduplication across the `GrammarDag`.
@@ -15,6 +20,9 @@ pub const fn should_intern_pair_globally(node: &RuleNode) -> bool {
 pub struct RuleInterner {
     pair_map: FxHashMap<u64, SymbolId>,
     run_map: FxHashMap<(SymbolId, u64), SymbolId>,
+    pub line_cache: Vec<(u64, SymbolId)>,
+    pub seen_table: Vec<u32>,
+    pub seed_rules_len: usize,
     indexed_rules: usize,
 }
 
@@ -23,23 +31,59 @@ impl RuleInterner {
         Self {
             pair_map: FxHashMap::default(),
             run_map: FxHashMap::default(),
+            line_cache: Vec::new(),
+            seen_table: Vec::new(),
+            seed_rules_len: 0,
             indexed_rules: 0,
         }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
         let mut pair_map = FxHashMap::default();
-        pair_map.reserve(cap);
+        pair_map.reserve(cap.min(524_288));
         Self {
             pair_map,
             run_map: FxHashMap::default(),
+            line_cache: Vec::new(),
+            seen_table: Vec::new(),
+            seed_rules_len: 0,
             indexed_rules: 0,
         }
+    }
+
+    pub fn ensure_line_cache(&mut self) {
+        if self.line_cache.is_empty() {
+            self.line_cache.resize(LINE_CACHE_SIZE, (0, SymbolId(0)));
+        }
+    }
+
+    pub fn prepare_seen_table(&mut self) -> &mut [u32] {
+        if self.seen_table.is_empty() {
+            self.seen_table.resize(SEEN_TABLE_SIZE, u32::MAX);
+        } else {
+            self.seen_table.fill(u32::MAX);
+        }
+        &mut self.seen_table[..]
     }
 
     #[inline(always)]
     pub const fn pack_pair_key(left: SymbolId, right: SymbolId) -> u64 {
         ((left.0 as u64) << 32) | (right.0 as u64)
+    }
+
+    #[inline(always)]
+    pub fn get_pair(&self, left: SymbolId, right: SymbolId) -> Option<SymbolId> {
+        self.pair_map.get(&Self::pack_pair_key(left, right)).copied()
+    }
+
+    #[inline(always)]
+    pub fn get_run(&self, child: SymbolId, count: u64) -> Option<SymbolId> {
+        self.run_map.get(&(child, count)).copied()
+    }
+
+    #[inline(always)]
+    pub fn pair_map_len(&self) -> usize {
+        self.pair_map.len()
     }
 
     /// Reconstructs the hash-consing table from an existing slice of `RuleNode`s.
@@ -261,6 +305,9 @@ impl RuleInterner {
     pub fn clear_tables(&mut self) {
         self.pair_map = FxHashMap::default();
         self.run_map = FxHashMap::default();
+        self.line_cache = Vec::new();
+        self.seen_table = Vec::new();
+        self.seed_rules_len = 0;
         self.indexed_rules = 0;
     }
 }
