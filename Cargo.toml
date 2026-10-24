@@ -3,6 +3,7 @@ name = "buttlick"
 version = "0.1.0"
 edition = "2021"
 description = "Grammar-Homomorphic Zero-Decompression Storage and Compute Engine"
+license = "MIT"
 authors = ["Buttlick Contributors"]
 
 [lib]
