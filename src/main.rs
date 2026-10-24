@@ -9,6 +9,7 @@ use buttlick::bench::run_benchmarks;
 use buttlick::engine::aggregate::AggregateQuery;
 use buttlick::engine::regex_compile::GrepMode;
 use buttlick::error::{ButtlickError, Result};
+use buttlick::format::MappedArchive;
 use buttlick::grammar::GrammarDag;
 
 const BINARY_MEDIA_EXTS: &[&str] = &[
@@ -589,7 +590,7 @@ fn run() -> Result<()> {
             all,
             color,
         } => {
-            let dag = GrammarDag::load_from_path(&input)?;
+            let archive = MappedArchive::open(&input)?;
             let max_lines = if limit == 0 { usize::MAX } else { limit };
             if lines {
                 let use_color = match color {
@@ -606,8 +607,8 @@ fn run() -> Result<()> {
                 } else {
                     None
                 };
-                if all || (doc.is_none() && dag.roots.len() > 1) {
-                    let results = dag.grep_lines_all_docs(&regex, max_lines)?;
+                if all || (doc.is_none() && archive.roots.len() > 1) {
+                    let results = archive.grep_lines_all_docs(&regex, max_lines)?;
                     let stdout = io::stdout();
                     let mut handle = io::BufWriter::new(stdout.lock());
                     for (name, matched_lines) in results {
@@ -623,7 +624,7 @@ fn run() -> Result<()> {
                     }
                     handle.flush()?;
                 } else {
-                    let matched_lines = dag.grep_lines(doc.as_deref(), &regex, max_lines)?;
+                    let matched_lines = archive.grep_lines(doc.as_deref(), &regex, max_lines)?;
                     let stdout = io::stdout();
                     let mut handle = io::BufWriter::new(stdout.lock());
                     for line in matched_lines {
@@ -643,8 +644,8 @@ fn run() -> Result<()> {
                 } else {
                     GrepMode::LineCount
                 };
-                if all {
-                    let results = dag.grep_all_docs(&regex, mode)?;
+                if all || (doc.is_none() && archive.roots.len() > 1) {
+                    let results = archive.grep_all_docs(&regex, mode)?;
                     let show_zeros = results.len() <= 16;
                     let mut total = 0u64;
                     for (name, c) in results {
@@ -655,7 +656,7 @@ fn run() -> Result<()> {
                     }
                     println!("TOTAL:{total}");
                 } else {
-                    let count = dag.grep(doc.as_deref(), &regex, mode)?;
+                    let count = archive.grep(doc.as_deref(), &regex, mode)?;
                     println!("{count}");
                 }
             }

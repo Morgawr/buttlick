@@ -347,6 +347,118 @@ impl GrammarDag {
     }
 }
 
+/// Zero-copy memory-mapped `.btlk` archive view that evaluates queries directly on the on-disk
+/// 8-byte `PackedRuleNode` array without allocating `Vec<RuleNode>`.
+pub struct MappedArchive {
+    mmap: Mmap,
+    pub roots: Vec<RootEntry>,
+    rules_offset: usize,
+    rules_end: usize,
+    pub num_rules: usize,
+}
+
+impl MappedArchive {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let bytes = &mmap[..];
+        if bytes.len() < BTLK_HEADER_SIZE + 8 {
+            return Err(ButtlickError::CorruptedFormat(format!(
+                "File too small: {} bytes",
+                bytes.len()
+            )));
+        }
+
+        let header = BtlkHeader::from_bytes(&bytes[0..BTLK_HEADER_SIZE])?;
+        let payload_end = bytes.len() - 8;
+        let roots_offset = header.roots_offset as usize;
+        let rules_offset = header.rules_offset as usize;
+        let num_rules = header.num_rules as usize;
+        let expected_rules_end = rules_offset
+            .checked_add(num_rules.checked_mul(PACKED_RULE_SIZE).ok_or_else(|| {
+                ButtlickError::CorruptedFormat("Rule table size overflow".into())
+            })?)
+            .ok_or_else(|| ButtlickError::CorruptedFormat("Rule offset overflow".into()))?;
+
+        if roots_offset != BTLK_HEADER_SIZE
+            || rules_offset < roots_offset
+            || !rules_offset.is_multiple_of(8)
+            || expected_rules_end != payload_end
+        {
+            return Err(ButtlickError::CorruptedFormat(
+                "Invalid section offsets in .btlk header".into(),
+            ));
+        }
+
+        let mut cursor = roots_offset;
+        let mut roots = Vec::with_capacity(header.num_roots as usize);
+        for _ in 0..header.num_roots {
+            if cursor + 32 > rules_offset {
+                return Err(ButtlickError::CorruptedFormat(
+                    "Truncated root entry header".into(),
+                ));
+            }
+            let name_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let has_symbol = bytes[cursor + 4];
+            let sym_raw = u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap());
+            let byte_len = u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap());
+            let kr_hash = u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap());
+            cursor += 32;
+
+            if cursor + name_len > rules_offset {
+                return Err(ButtlickError::CorruptedFormat(
+                    "Truncated root entry name".into(),
+                ));
+            }
+            let name = std::str::from_utf8(&bytes[cursor..cursor + name_len])
+                .map_err(|e| {
+                    ButtlickError::CorruptedFormat(format!("Invalid UTF-8 root name: {e}"))
+                })?
+                .to_string();
+            cursor += name_len;
+
+            let root_symbol = if has_symbol == 0 {
+                None
+            } else {
+                Some(SymbolId(sym_raw))
+            };
+            roots.push(RootEntry {
+                name,
+                root_symbol,
+                byte_len,
+                kr_hash,
+            });
+        }
+
+        Ok(Self {
+            mmap,
+            roots,
+            rules_offset,
+            rules_end: expected_rules_end,
+            num_rules,
+        })
+    }
+
+    #[inline(always)]
+    pub fn rules_bytes(&self) -> &[u8] {
+        &self.mmap[self.rules_offset..self.rules_end]
+    }
+
+    pub fn find_root(&self, doc_name: Option<&str>) -> Result<&RootEntry> {
+        match doc_name {
+            Some(name) => self
+                .roots
+                .iter()
+                .find(|r| r.name == name)
+                .ok_or_else(|| ButtlickError::DocumentNotFound(name.to_string())),
+            None => self.roots.first().ok_or_else(|| {
+                ButtlickError::DocumentNotFound("<empty archive>".to_string())
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

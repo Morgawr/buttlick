@@ -6,6 +6,8 @@ use rustc_hash::FxHashMap;
 
 use crate::engine::transducer::MealyTransducer;
 use crate::error::{ButtlickError, Result};
+use crate::format::header::PackedRuleNode;
+use crate::format::MappedArchive;
 use crate::grammar::{GrammarDag, SymbolId};
 
 /// Evaluation mode for regex queries over the compressed `GrammarDag`.
@@ -54,6 +56,10 @@ pub fn compile_line_grep_transducer(pattern: &str) -> Result<MealyTransducer> {
 
     let mut dfa_to_trans: FxHashMap<StateID, u16> = FxHashMap::default();
     let mut trans_to_dfa: Vec<StateID> = Vec::new();
+
+    if !empty_line_matches && !dfa.is_match_state(q_dfa_start) {
+        dfa_to_trans.insert(q_dfa_start, IDLE_LINE_START);
+    }
 
     let map_active_state = |sid: StateID,
                             map: &mut FxHashMap<StateID, u16>,
@@ -364,6 +370,684 @@ impl GrammarDag {
         }
         Ok(results)
     }
+}
+
+#[inline]
+fn eval_sym_state(
+    sym: SymbolId,
+    q: u16,
+    rules_bytes: &[u8],
+    terminal_packed: &[u8],
+    table: &[u8],
+    memo: &mut FxHashMap<u64, u8>,
+) -> u8 {
+    if q == 0 {
+        return unsafe { *table.get_unchecked(sym.0 as usize) };
+    }
+    if let Some(b) = sym.as_byte() {
+        return terminal_packed[(q as usize) * 256 + (b as usize)];
+    }
+    let key = ((sym.0 as u64) << 16) | (q as u64);
+    if let Some(&cached) = memo.get(&key) {
+        return cached;
+    }
+    let off = sym.rule_index() * 8;
+    let w0 = u32::from_le_bytes([
+        rules_bytes[off],
+        rules_bytes[off + 1],
+        rules_bytes[off + 2],
+        rules_bytes[off + 3],
+    ]);
+    let w1 = u32::from_le_bytes([
+        rules_bytes[off + 4],
+        rules_bytes[off + 5],
+        rules_bytes[off + 6],
+        rules_bytes[off + 7],
+    ]);
+    let res = if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
+        let l_val = eval_sym_state(SymbolId(w0), q, rules_bytes, terminal_packed, table, memo);
+        let q_mid = (l_val & 0x7F) as u16;
+        let r_val = if q_mid == 0 {
+            unsafe { *table.get_unchecked(w1 as usize) }
+        } else {
+            eval_sym_state(
+                SymbolId(w1),
+                q_mid,
+                rules_bytes,
+                terminal_packed,
+                table,
+                memo,
+            )
+        };
+        r_val | (l_val & 0x80)
+    } else {
+        let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
+        eval_run_state(
+            child,
+            w1 as u64,
+            q,
+            rules_bytes,
+            terminal_packed,
+            table,
+            memo,
+        )
+    };
+    memo.insert(key, res);
+    res
+}
+
+#[inline]
+fn eval_run_state(
+    child: SymbolId,
+    count: u64,
+    q: u16,
+    rules_bytes: &[u8],
+    terminal_packed: &[u8],
+    table: &[u8],
+    memo: &mut FxHashMap<u64, u8>,
+) -> u8 {
+    let mut cur_q = q;
+    let mut emitted = 0u8;
+    for _ in 0..count {
+        let v = eval_sym_state(child, cur_q, rules_bytes, terminal_packed, table, memo);
+        let next_q = (v & 0x7F) as u16;
+        emitted |= v & 0x80;
+        if next_q == cur_q {
+            break;
+        }
+        cur_q = next_q;
+    }
+    (cur_q as u8) | emitted
+}
+
+fn append_rev_until_nl(rules_bytes: &[u8], sym: SymbolId, rev_buf: &mut Vec<u8>) -> bool {
+    if let Some(b) = sym.as_byte() {
+        if b == b'\n' {
+            return true;
+        }
+        rev_buf.push(b);
+        return false;
+    }
+    let off = sym.rule_index() * 8;
+    let w0 = u32::from_le_bytes([
+        rules_bytes[off],
+        rules_bytes[off + 1],
+        rules_bytes[off + 2],
+        rules_bytes[off + 3],
+    ]);
+    let w1 = u32::from_le_bytes([
+        rules_bytes[off + 4],
+        rules_bytes[off + 5],
+        rules_bytes[off + 6],
+        rules_bytes[off + 7],
+    ]);
+    if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
+        if append_rev_until_nl(rules_bytes, SymbolId(w1), rev_buf) {
+            return true;
+        }
+        append_rev_until_nl(rules_bytes, SymbolId(w0), rev_buf)
+    } else {
+        let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
+        let count = w1 as u64;
+        for _ in 0..count {
+            if append_rev_until_nl(rules_bytes, child, rev_buf) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_emitted_lines_mapped(
+    sym: SymbolId,
+    q: u16,
+    limit: usize,
+    rules_bytes: &[u8],
+    terminal_packed: &[u8],
+    table: &[u8],
+    memo: &mut FxHashMap<u64, u8>,
+    left_siblings: &mut Vec<(SymbolId, u64)>,
+    out_lines: &mut Vec<String>,
+) -> u16 {
+    let v = eval_sym_state(sym, q, rules_bytes, terminal_packed, table, memo);
+    let q_out = (v & 0x7F) as u16;
+    let has_emit = (v & 0x80) != 0;
+    if !has_emit || out_lines.len() >= limit {
+        return q_out;
+    }
+    if sym.is_terminal() {
+        let mut rev_buf = Vec::with_capacity(128);
+        for &(sib_sym, sib_count) in left_siblings.iter().rev() {
+            let mut hit_nl = false;
+            for _ in 0..sib_count {
+                if append_rev_until_nl(rules_bytes, sib_sym, &mut rev_buf) {
+                    hit_nl = true;
+                    break;
+                }
+            }
+            if hit_nl {
+                break;
+            }
+        }
+        rev_buf.reverse();
+        out_lines.push(String::from_utf8_lossy(&rev_buf).into_owned());
+        return q_out;
+    }
+
+    let off = sym.rule_index() * 8;
+    let w0 = u32::from_le_bytes([
+        rules_bytes[off],
+        rules_bytes[off + 1],
+        rules_bytes[off + 2],
+        rules_bytes[off + 3],
+    ]);
+    let w1 = u32::from_le_bytes([
+        rules_bytes[off + 4],
+        rules_bytes[off + 5],
+        rules_bytes[off + 6],
+        rules_bytes[off + 7],
+    ]);
+
+    if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
+        let left = SymbolId(w0);
+        let right = SymbolId(w1);
+        let q_mid = walk_emitted_lines_mapped(
+            left,
+            q,
+            limit,
+            rules_bytes,
+            terminal_packed,
+            table,
+            memo,
+            left_siblings,
+            out_lines,
+        );
+        if out_lines.len() < limit {
+            left_siblings.push((left, 1));
+            let _ = walk_emitted_lines_mapped(
+                right,
+                q_mid,
+                limit,
+                rules_bytes,
+                terminal_packed,
+                table,
+                memo,
+                left_siblings,
+                out_lines,
+            );
+            left_siblings.pop();
+        }
+        q_out
+    } else {
+        let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
+        let count = w1 as u64;
+        let mut cur_q = q;
+        for i in 0..count {
+            if out_lines.len() >= limit {
+                break;
+            }
+            let cv = eval_sym_state(child, cur_q, rules_bytes, terminal_packed, table, memo);
+            let next_q = (cv & 0x7F) as u16;
+            if (cv & 0x80) == 0 {
+                if next_q == cur_q {
+                    break;
+                }
+                cur_q = next_q;
+                continue;
+            }
+            if i > 0 {
+                left_siblings.push((child, i));
+            }
+            cur_q = walk_emitted_lines_mapped(
+                child,
+                cur_q,
+                limit,
+                rules_bytes,
+                terminal_packed,
+                table,
+                memo,
+                left_siblings,
+                out_lines,
+            );
+            if i > 0 {
+                left_siblings.pop();
+            }
+        }
+        q_out
+    }
+}
+
+impl MappedArchive {
+    fn build_fast_line_table(
+        &self,
+        transducer: &MealyTransducer,
+    ) -> (Vec<u8>, Vec<u8>, FxHashMap<u64, u8>) {
+        let s = transducer.num_states;
+        let mut terminal_packed = vec![0u8; s * 256];
+        for q in 0..s {
+            for b in 0..=255usize {
+                let idx = q * 256 + b;
+                let nq = transducer.byte_next[idx] as u8;
+                let em = if transducer.byte_emit[idx] > 0 {
+                    0x80
+                } else {
+                    0
+                };
+                terminal_packed[idx] = nq | em;
+            }
+        }
+
+        let rules_bytes = self.rules_bytes();
+        let mut table = vec![0u8; 256 + self.num_rules];
+        table[0..256].copy_from_slice(&terminal_packed[0..256]);
+        let mut memo: FxHashMap<u64, u8> = FxHashMap::default();
+
+        for (idx, chunk) in rules_bytes.chunks_exact(8).enumerate() {
+            let w0 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let w1 = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let sym_idx = 256 + idx;
+            if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
+                let l_val = unsafe { *table.get_unchecked(w0 as usize) };
+                if (l_val & 0x7F) == 0 {
+                    let r_val = unsafe { *table.get_unchecked(w1 as usize) };
+                    unsafe {
+                        *table.get_unchecked_mut(sym_idx) = r_val | l_val;
+                    }
+                } else {
+                    let q_mid = (l_val & 0x7F) as u16;
+                    let r_val = eval_sym_state(
+                        SymbolId(w1),
+                        q_mid,
+                        rules_bytes,
+                        &terminal_packed,
+                        &table,
+                        &mut memo,
+                    );
+                    table[sym_idx] = r_val | (l_val & 0x80);
+                }
+            } else {
+                let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
+                table[sym_idx] = eval_run_state(
+                    child,
+                    w1 as u64,
+                    0,
+                    rules_bytes,
+                    &terminal_packed,
+                    &table,
+                    &mut memo,
+                );
+            }
+        }
+
+        (terminal_packed, table, memo)
+    }
+
+    /// Zero-copy, 1-byte-per-symbol extraction of matching lines on a single document.
+    pub fn grep_lines(
+        &self,
+        doc_name: Option<&str>,
+        pattern: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let root = self.find_root(doc_name)?;
+        let Some(sym) = root.root_symbol else {
+            return Ok(Vec::new());
+        };
+        let transducer = compile_line_grep_transducer(pattern)?;
+        let (terminal_packed, table, mut memo) = self.build_fast_line_table(&transducer);
+        let rules_bytes = self.rules_bytes();
+        let mut out_lines = Vec::new();
+        let mut left_siblings = Vec::with_capacity(32);
+
+        let root_val = table[sym.0 as usize];
+        let final_q = (root_val & 0x7F) as usize;
+        if (root_val & 0x80) != 0 {
+            let _ = walk_emitted_lines_mapped(
+                sym,
+                0,
+                limit,
+                rules_bytes,
+                &terminal_packed,
+                &table,
+                &mut memo,
+                &mut left_siblings,
+                &mut out_lines,
+            );
+        }
+        if out_lines.len() < limit && transducer.eof_emit[final_q] > 0 {
+            let mut rev_buf = Vec::with_capacity(128);
+            let _ = append_rev_until_nl(rules_bytes, sym, &mut rev_buf);
+            rev_buf.reverse();
+            out_lines.push(String::from_utf8_lossy(&rev_buf).into_owned());
+        }
+        Ok(out_lines)
+    }
+
+    /// Zero-copy, 1-byte-per-symbol extraction of matching lines across ALL documents in the archive.
+    pub fn grep_lines_all_docs(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let transducer = compile_line_grep_transducer(pattern)?;
+        let (terminal_packed, table, mut memo) = self.build_fast_line_table(&transducer);
+        let rules_bytes = self.rules_bytes();
+        let mut results = Vec::new();
+        let mut remaining = limit;
+        let mut left_siblings = Vec::with_capacity(32);
+
+        for root in &self.roots {
+            if remaining == 0 {
+                break;
+            }
+            let Some(sym) = root.root_symbol else {
+                continue;
+            };
+            let root_val = table[sym.0 as usize];
+            let final_q = (root_val & 0x7F) as usize;
+            let has_eof = transducer.eof_emit[final_q] > 0;
+            if (root_val & 0x80) == 0 && !has_eof {
+                continue;
+            }
+            let mut doc_lines = Vec::new();
+            if (root_val & 0x80) != 0 {
+                left_siblings.clear();
+                let _ = walk_emitted_lines_mapped(
+                    sym,
+                    0,
+                    remaining,
+                    rules_bytes,
+                    &terminal_packed,
+                    &table,
+                    &mut memo,
+                    &mut left_siblings,
+                    &mut doc_lines,
+                );
+            }
+            if doc_lines.len() < remaining && has_eof {
+                let mut rev_buf = Vec::with_capacity(128);
+                let _ = append_rev_until_nl(rules_bytes, sym, &mut rev_buf);
+                rev_buf.reverse();
+                doc_lines.push(String::from_utf8_lossy(&rev_buf).into_owned());
+            }
+            if !doc_lines.is_empty() {
+                remaining = remaining.saturating_sub(doc_lines.len());
+                results.push((root.name.clone(), doc_lines));
+            }
+        }
+        Ok(results)
+    }
+
+    fn build_fast_count_table(
+        &self,
+        transducer: &MealyTransducer,
+    ) -> (Vec<u8>, FxHashMap<u32, u64>) {
+        let s = transducer.num_states;
+        let mut terminal_packed = vec![0u8; s * 256];
+        for q in 0..s {
+            for b in 0..=255usize {
+                let idx = q * 256 + b;
+                let nq = transducer.byte_next[idx] as u8;
+                let em = if transducer.byte_emit[idx] > 0 {
+                    0x80
+                } else {
+                    0
+                };
+                terminal_packed[idx] = nq | em;
+            }
+        }
+
+        let rules_bytes = self.rules_bytes();
+        let mut table = vec![0u8; 256 + self.num_rules];
+        table[0..256].copy_from_slice(&terminal_packed[0..256]);
+        let mut emit0_counts: FxHashMap<u32, u64> = FxHashMap::default();
+        let mut memo: FxHashMap<u64, (u8, u64)> = FxHashMap::default();
+
+        for (idx, chunk) in rules_bytes.chunks_exact(8).enumerate() {
+            let w0 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let w1 = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let sym_idx = 256 + idx;
+            if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
+                let l_val = unsafe { *table.get_unchecked(w0 as usize) };
+                if (l_val & 0x7F) == 0 {
+                    let r_val = unsafe { *table.get_unchecked(w1 as usize) };
+                    let out_val = r_val | l_val;
+                    unsafe {
+                        *table.get_unchecked_mut(sym_idx) = out_val;
+                    }
+                    if (out_val & 0x80) != 0 {
+                        let lc = if (l_val & 0x80) == 0 {
+                            0
+                        } else if w0 < 256 {
+                            1
+                        } else {
+                            emit0_counts[&w0]
+                        };
+                        let rc = if (r_val & 0x80) == 0 {
+                            0
+                        } else if w1 < 256 {
+                            1
+                        } else {
+                            emit0_counts[&w1]
+                        };
+                        emit0_counts.insert(sym_idx as u32, lc + rc);
+                    }
+                } else {
+                    let q_mid = (l_val & 0x7F) as u16;
+                    let lc = if (l_val & 0x80) == 0 {
+                        0
+                    } else if w0 < 256 {
+                        1
+                    } else {
+                        emit0_counts[&w0]
+                    };
+                    let (r_val, rc) = eval_sym_count_state(
+                        SymbolId(w1),
+                        q_mid,
+                        rules_bytes,
+                        &terminal_packed,
+                        &table,
+                        &emit0_counts,
+                        &mut memo,
+                    );
+                    let out_val = r_val | (l_val & 0x80);
+                    table[sym_idx] = out_val;
+                    if (out_val & 0x80) != 0 {
+                        emit0_counts.insert(sym_idx as u32, lc + rc);
+                    }
+                }
+            } else {
+                let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
+                let (out_val, c) = eval_run_count_state(
+                    child,
+                    w1 as u64,
+                    0,
+                    rules_bytes,
+                    &terminal_packed,
+                    &table,
+                    &emit0_counts,
+                    &mut memo,
+                );
+                table[sym_idx] = out_val;
+                if (out_val & 0x80) != 0 {
+                    emit0_counts.insert(sym_idx as u32, c);
+                }
+            }
+        }
+
+        (table, emit0_counts)
+    }
+
+    pub fn grep(&self, doc_name: Option<&str>, pattern: &str, mode: GrepMode) -> Result<u64> {
+        let root = self.find_root(doc_name)?;
+        let Some(sym) = root.root_symbol else {
+            return Ok(0);
+        };
+        let transducer = match mode {
+            GrepMode::LineCount => compile_line_grep_transducer(pattern)?,
+            GrepMode::MatchCount => compile_match_count_transducer(pattern)?,
+        };
+        let (table, emit0_counts) = self.build_fast_count_table(&transducer);
+        let root_val = table[sym.0 as usize];
+        let final_q = (root_val & 0x7F) as usize;
+        let stream_c = if (root_val & 0x80) == 0 {
+            0
+        } else if sym.0 < 256 {
+            1
+        } else {
+            emit0_counts[&sym.0]
+        };
+        Ok(stream_c + transducer.eof_emit[final_q])
+    }
+
+    pub fn grep_all_docs(&self, pattern: &str, mode: GrepMode) -> Result<Vec<(String, u64)>> {
+        let transducer = match mode {
+            GrepMode::LineCount => compile_line_grep_transducer(pattern)?,
+            GrepMode::MatchCount => compile_match_count_transducer(pattern)?,
+        };
+        let (table, emit0_counts) = self.build_fast_count_table(&transducer);
+        let mut results = Vec::with_capacity(self.roots.len());
+        for root in &self.roots {
+            let c = match root.root_symbol {
+                None => 0,
+                Some(sym) => {
+                    let root_val = table[sym.0 as usize];
+                    let final_q = (root_val & 0x7F) as usize;
+                    let stream_c = if (root_val & 0x80) == 0 {
+                        0
+                    } else if sym.0 < 256 {
+                        1
+                    } else {
+                        emit0_counts[&sym.0]
+                    };
+                    stream_c + transducer.eof_emit[final_q]
+                }
+            };
+            results.push((root.name.clone(), c));
+        }
+        Ok(results)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_sym_count_state(
+    sym: SymbolId,
+    q: u16,
+    rules_bytes: &[u8],
+    terminal_packed: &[u8],
+    table: &[u8],
+    emit0_counts: &FxHashMap<u32, u64>,
+    memo: &mut FxHashMap<u64, (u8, u64)>,
+) -> (u8, u64) {
+    if q == 0 {
+        let v = unsafe { *table.get_unchecked(sym.0 as usize) };
+        let c = if (v & 0x80) == 0 {
+            0
+        } else if sym.0 < 256 {
+            1
+        } else {
+            emit0_counts[&sym.0]
+        };
+        return (v, c);
+    }
+    if let Some(b) = sym.as_byte() {
+        let v = terminal_packed[(q as usize) * 256 + (b as usize)];
+        return (v, ((v & 0x80) != 0) as u64);
+    }
+    let key = ((sym.0 as u64) << 16) | (q as u64);
+    if let Some(&cached) = memo.get(&key) {
+        return cached;
+    }
+    let off = sym.rule_index() * 8;
+    let w0 = u32::from_le_bytes([
+        rules_bytes[off],
+        rules_bytes[off + 1],
+        rules_bytes[off + 2],
+        rules_bytes[off + 3],
+    ]);
+    let w1 = u32::from_le_bytes([
+        rules_bytes[off + 4],
+        rules_bytes[off + 5],
+        rules_bytes[off + 6],
+        rules_bytes[off + 7],
+    ]);
+    let res = if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
+        let (l_val, lc) = eval_sym_count_state(
+            SymbolId(w0),
+            q,
+            rules_bytes,
+            terminal_packed,
+            table,
+            emit0_counts,
+            memo,
+        );
+        let q_mid = (l_val & 0x7F) as u16;
+        let (r_val, rc) = eval_sym_count_state(
+            SymbolId(w1),
+            q_mid,
+            rules_bytes,
+            terminal_packed,
+            table,
+            emit0_counts,
+            memo,
+        );
+        (r_val | (l_val & 0x80), lc + rc)
+    } else {
+        let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
+        eval_run_count_state(
+            child,
+            w1 as u64,
+            q,
+            rules_bytes,
+            terminal_packed,
+            table,
+            emit0_counts,
+            memo,
+        )
+    };
+    memo.insert(key, res);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_run_count_state(
+    child: SymbolId,
+    count: u64,
+    q: u16,
+    rules_bytes: &[u8],
+    terminal_packed: &[u8],
+    table: &[u8],
+    emit0_counts: &FxHashMap<u32, u64>,
+    memo: &mut FxHashMap<u64, (u8, u64)>,
+) -> (u8, u64) {
+    let mut cur_q = q;
+    let mut emitted_flag = 0u8;
+    let mut total_c = 0u64;
+    for i in 0..count {
+        let (v, c) = eval_sym_count_state(
+            child,
+            cur_q,
+            rules_bytes,
+            terminal_packed,
+            table,
+            emit0_counts,
+            memo,
+        );
+        let next_q = (v & 0x7F) as u16;
+        if next_q == cur_q {
+            let rem = count - i;
+            if c > 0 {
+                emitted_flag |= 0x80;
+                total_c += rem * c;
+            }
+            break;
+        }
+        emitted_flag |= v & 0x80;
+        total_c += c;
+        cur_q = next_q;
+    }
+    ((cur_q as u8) | emitted_flag, total_c)
 }
 
 #[cfg(test)]
