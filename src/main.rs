@@ -1,8 +1,8 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 
 use buttlick::bench::run_benchmarks;
@@ -215,6 +215,16 @@ enum Commands {
         /// Query across all documents in the archive in a single shared-DAG pass
         #[arg(short = 'a', long)]
         all: bool,
+        /// Colorize matched strings and filenames (`auto`, `always`, `never`)
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = ColorMode::Auto,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "always"
+        )]
+        color: ColorMode,
     },
 
     /// Zero-decompression structured analytics (CSV / TSV / Log column aggregations)
@@ -298,6 +308,51 @@ enum EditAction {
         #[arg(long)]
         new_name: String,
     },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+fn write_slurp_line(
+    w: &mut impl Write,
+    doc_name: Option<&str>,
+    line: &str,
+    re: Option<&regex::Regex>,
+    use_color: bool,
+) -> io::Result<()> {
+    if let Some(name) = doc_name {
+        if use_color {
+            write!(w, "\x1b[35m{name}\x1b[0m\x1b[36m:\x1b[0m")?;
+        } else {
+            write!(w, "{name}:")?;
+        }
+    }
+    if use_color {
+        if let Some(re) = re {
+            let mut last = 0usize;
+            for m in re.find_iter(line) {
+                if m.start() > last {
+                    w.write_all(&line.as_bytes()[last..m.start()])?;
+                }
+                if !m.is_empty() {
+                    w.write_all(b"\x1b[1;31m")?;
+                    w.write_all(m.as_str().as_bytes())?;
+                    w.write_all(b"\x1b[0m")?;
+                }
+                last = m.end();
+            }
+            if last < line.len() {
+                w.write_all(&line.as_bytes()[last..])?;
+            }
+            w.write_all(b"\n")?;
+            return Ok(());
+        }
+    }
+    writeln!(w, "{line}")
 }
 
 fn parse_delimiter(s: &str) -> Result<u8> {
@@ -532,17 +587,38 @@ fn run() -> Result<()> {
             match_count,
             doc,
             all,
+            color,
         } => {
             let dag = GrammarDag::load_from_path(&input)?;
             let max_lines = if limit == 0 { usize::MAX } else { limit };
             if lines {
+                let use_color = match color {
+                    ColorMode::Always => true,
+                    ColorMode::Never => false,
+                    ColorMode::Auto => io::stdout().is_terminal(),
+                };
+                let highlight_re = if use_color {
+                    regex::RegexBuilder::new(&regex)
+                        .multi_line(false)
+                        .dot_matches_new_line(false)
+                        .build()
+                        .ok()
+                } else {
+                    None
+                };
                 if all || (doc.is_none() && dag.roots.len() > 1) {
                     let results = dag.grep_lines_all_docs(&regex, max_lines)?;
                     let stdout = io::stdout();
                     let mut handle = io::BufWriter::new(stdout.lock());
                     for (name, matched_lines) in results {
                         for line in matched_lines {
-                            writeln!(handle, "{name}:{line}")?;
+                            write_slurp_line(
+                                &mut handle,
+                                Some(&name),
+                                &line,
+                                highlight_re.as_ref(),
+                                use_color,
+                            )?;
                         }
                     }
                     handle.flush()?;
@@ -551,7 +627,13 @@ fn run() -> Result<()> {
                     let stdout = io::stdout();
                     let mut handle = io::BufWriter::new(stdout.lock());
                     for line in matched_lines {
-                        writeln!(handle, "{line}")?;
+                        write_slurp_line(
+                            &mut handle,
+                            None,
+                            &line,
+                            highlight_re.as_ref(),
+                            use_color,
+                        )?;
                     }
                     handle.flush()?;
                 }
