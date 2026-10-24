@@ -1,61 +1,126 @@
-# Buttlick (`buttlick`)
+# buttlick
 
-**Grammar-Homomorphic Zero-Decompression Storage & Compute Engine**
+`buttlick` is a compression tool and archive format (`.btlk`) that lets you slurp, slice, aggregate, and edit compressed files directly—without decompressing them first.
 
-Buttlick compresses raw byte streams and multi-document corpora into a canonically hash-consed **Run-Length Straight-Line Program (RLSLP) DAG** using **Locally Consistent Parsing (Recompression)**. Because the compressed representation is a balanced Context-Free Grammar DAG of depth $O(\log N)$ with $n \ll N$ unique production rules, Buttlick compiles queries—substring searches, arbitrary regular expressions, line-oriented `grep`, structured numerical aggregations (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`), random-access slicing, $O(\log N)$ substring equality, and persistent edits—into **Algebraic Monoid Homomorphisms** that execute directly on the compressed grammar rules in $O(n)$ or $O(\log N)$ time **without decompressing the underlying data**.
+Standard compressors (`zstd`, `gzip`, `xz`) pack data into opaque blocks. To grep or slice a compressed archive, you have to decompress the stream back into memory. `buttlick` instead compresses files into a deduplicated tree of grammar rules, allowing queries to run directly on the compressed structure via `mmap`.
 
----
-
-## Core Algebraic Engines
-
-1. **Mersenne Prime $\mathbb{F}_{2^{61}-1}$ Homomorphic Fingerprinting (`src/hash.rs`, `src/grammar/navigate.rs`)**
-   - Every symbol maintains its precomputed Karp-Rabin polynomial hash and power over $P = 2^{61}-1$.
-   - Arbitrary byte intervals $[i, i+L)$ decompose into at most $2H = O(\log N)$ canonical grammar pieces, enabling $O(\log N)$ equality checks across multi-gigabyte ranges.
-2. **Algebra 1: KMP Seam-Tracking Monoid (`src/engine/kmp_seam.rs`)**
-   - Counts exact literal occurrences in $O(n \cdot |P|)$ time by tracking $(m-1)$-byte prefixes/suffixes across `Pair` seams and binary-exponentiating `Run` rules in $O(|P| \log k)$ time.
-   - Extracts top-$K$ 64-bit byte offsets lazily in $O(K \log N)$ time by pruning zero-match subtrees in $O(1)$.
-3. **Algebra 2: Wreath-Product Mealy Transducer Monoid (`src/engine/transducer.rs`, `src/engine/regex_compile.rs`)**
-   - Compiles arbitrary regular expressions (`LineCount` / `grep -E -c` and `MatchCount`) into dense state-to-state transition and weight-emission summaries $\mathcal{T}(X) = (\Delta_X, \Omega_X)$ composed in $O(|Q|)$ time and raised to $k$-th powers on RLE rules in $O(|Q| \log k)$ time.
-4. **Algebra 3: Affine Place-Value & Line-Stream Record Aggregator (`src/engine/aggregate.rs`)**
-   - Evaluates `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` with optional column equality predicates directly over compressed CSV, TSV, and `key=value` log streams.
-5. **Dynamic $O(\log N)$ Persistent DAG Surgery (`src/grammar/edit.rs`)**
-   - Supports height-balanced `concat`, `split`, `insert`, `delete`, and homomorphic `replace_all` directly on `.btlk` archives without full decompression.
-
----
-
-## Command-Line Interface
+## Build
 
 ```bash
-# 1. Compress one or more files into a .btlk archive
-buttlick compress <INPUT_FILES>... -o <OUTPUT.btlk> [--stats]
-
-# 2. Decompress a .btlk archive (or specific named root) back to raw bytes
-buttlick decompress <INPUT.btlk> [-o <OUTPUT_FILE>] [--doc <NAME>]
-
-# 3. Inspect DAG structure, compression ratio, tree depth, and rule statistics
-buttlick inspect <INPUT.btlk> [--json]
-
-# 4. O(log N) random-access byte slice extraction
-buttlick slice <INPUT.btlk> --start <OFFSET> --len <LENGTH> [--doc <NAME>]
-
-# 5. O(log N) substring equality check between two arbitrary ranges
-buttlick eq <INPUT.btlk> --pos1 <OFFSET1> --pos2 <OFFSET2> --len <LENGTH> [--doc <NAME>]
-
-# 6. Zero-decompression exact substring search (count + optional byte offsets)
-buttlick count <INPUT.btlk> <PATTERN> [--offsets] [--limit <K>] [--doc <NAME>]
-
-# 7. Zero-decompression regular expression search & line-count (`grep -E -c` equivalent)
-buttlick grep <INPUT.btlk> <REGEX> [--line-count | --match-count] [--doc <NAME>]
-
-# 8. Zero-decompression structured analytics (CSV / TSV / Log column aggregations)
-buttlick query <INPUT.btlk> --delimiter <CHAR> --col <INDEX> [--where-col <IDX> --where-eq <STR>] [--json]
-
-# 9. Zero-decompression persistent edits directly on .btlk files
-buttlick edit <IN.btlk> -o <OUT.btlk> insert --offset <POS> --text <STRING>
-buttlick edit <IN.btlk> -o <OUT.btlk> delete --offset <POS> --len <LEN>
-buttlick edit <IN.btlk> -o <OUT.btlk> replace --pattern <PAT> --with <REPL>
-buttlick edit <IN.btlk> -o <OUT.btlk> concat --doc1 <NAME1> --doc2 <NAME2> --new-name <NAME>
-
-# 10. Built-in Benchmark Suite
-buttlick bench [--size-mb <MB>] [--json]
+cargo build --release
 ```
+
+## Quick Start
+
+### 1. Compress files or entire directories
+
+Compress a directory or set of files into a single `.btlk` archive. All files in the archive share the same deduplicated rule dictionary.
+
+```bash
+# Compress a directory tree with progress stats
+buttlick compress ./source_code -o source_code.btlk --stats
+
+# Skip binary media/archives (.png, .jpg, .zip, etc.) or specific extensions
+buttlick compress ./game_data -o script.btlk --text-only
+buttlick compress ./logs -o logs.btlk --exclude-ext bin,idx
+```
+
+### 2. Slurp a compressed buttlick archive
+
+`slurp` is like `grep -E` directly inside a `.btlk` compressed file.
+
+```bash
+# Print matching lines across all files in the archive
+buttlick slurp script.btlk "I can't let you get close!" -n
+
+# Print matching lines for a regex pattern, capped at 50 results
+buttlick slurp linux_kernel.btlk "kfree_rcu\(" -n --limit 50
+
+# Count matching lines across the archive (like grep -E -c)
+buttlick slurp linux_kernel.btlk "EXPORT_SYMBOL_GPL" -c
+
+# Search inside a single specific file in the archive
+buttlick slurp linux_kernel.btlk "schedule_timeout" -n --doc kernel/sched/core.c
+```
+
+### 3. Extract byte slices directly without decompression
+
+Because the archive is a balanced tree, jumping to an arbitrary byte offset takes microseconds even on very large files
+
+```bash
+# Read 256 bytes starting at offset 10,000,000
+buttlick slice linux_kernel.btlk --doc drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c --start 10000 --len 256
+
+# Check if two 1MB regions are byte-for-byte identical in O(log N) time
+buttlick eq archive.btlk --pos1 0 --pos2 1048576 --len 1048576
+```
+
+### 4. Count substrings and find byte offsets
+
+```bash
+# Count exact occurrences across all documents
+buttlick count linux_kernel.btlk " mutex_lock(" --all
+
+# Print the first 20 byte offsets where the pattern appears
+buttlick count script.btlk "I can't let you get close!" --offsets --limit 20
+```
+
+### 5. Run analytics on compressed CSV / TSV / logs
+
+Compute `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` on a numeric column directly on the compressed rules.
+
+```bash
+# Aggregate column 3 (0-indexed) where column 1 == "ERROR"
+buttlick query access.btlk --delimiter "," --col 3 --where-col 1 --where-eq "ERROR"
+```
+
+### 6. Edit a compressed archive in place
+
+Insert, delete, concatenate, or replace text directly in the grammar tree without decompressing and recompressing the whole archive.
+
+```bash
+# Replace all occurrences of a string across a document
+buttlick edit input.btlk -o output.btlk --doc config.json replace --pattern "localhost" --with "10.0.0.1"
+
+# Insert or delete bytes at an exact offset
+buttlick edit input.btlk -o output.btlk insert --offset 0 --text "// Header\n"
+buttlick edit input.btlk -o output.btlk delete --offset 0 --len 10
+```
+
+### 7. Decompress (`decompress` & `inspect`)
+
+```bash
+# Extract an entire multi-file archive back to a directory
+buttlick decompress linux_kernel.btlk --out-dir ./linux
+
+# Extract a single file to stdout
+buttlick decompress linux_kernel.btlk --doc README > README
+
+# Inspect archive size, rule count, and tree height
+buttlick inspect linux_kernel.btlk
+```
+
+---
+
+## How It Works
+
+Instead of sliding-window LZ77 + entropy coding (which destroys random access and forces sequential decompression), `buttlick` builds a **Grammar DAG** (Directed Acyclic Graph):
+
+1. **Deduplicated Grammar Rules**:
+   Every file is broken into lines and tokens, then bottom-up paired into two kinds of rules:
+   - `Pair(left, right)`: concatenates two symbols (`left` followed by `right`).
+   - `Run(child, count)`: repeats `child` `count` times in a row.
+
+   Identical substrings, tokens, and lines anywhere across the archive are hash-consed to the exact same 32-bit `SymbolId`. If a boilerplate header or log prefix appears 50,000 times across 10,000 files, it is represented by a single rule subtree.
+
+2. **Deterministic Cut Points (Locally Consistent Parsing)**:
+   When two files differ by a few bytes in the middle, naive pair-folding shifts boundaries and ruins deduplication. `buttlick` picks merge boundaries using local hash landmarks (local maxima/minima of adjacent symbol hashes), so edits stay localized and identical surrounding text always compiles to the same rule IDs.
+
+3. **Bottom-Up Query Evaluation (Why `slurp` is fast)**:
+   On disk, the `.btlk` rule table is stored as a flat array of 8-byte `PackedRuleNode` structs in topological order (children always have lower IDs than parents).
+   - When you run `buttlick slurp`, the binary `mmap`s the `.btlk` file directly from the OS page cache with near-zero RAM overhead (~18 MB RSS on a 200 MB archive).
+   - For literal queries, a single bottom-up pass checks if the pattern appears at the seam between `left` and `right` of each rule. Because rules are evaluated in order, if a rule matches, that result is reused everywhere the rule appears.
+   - To print matching lines (`-n`), `buttlick` only descends into branches flagged as containing a match and expands the surrounding `[prev_newline, next_newline]` span. Branches without matches are skipped in $O(1)$.
+
+4. **$O(\log N)$ Random Access & Slicing**:
+   Each rule stores its expanded byte length and a 61-bit Karp-Rabin hash. Because the grammar tree height is bounded ($H \approx 30\text{–}40$ even for multi-gigabyte corpora), `slice` and `eq` walk down from a document's root symbol using subtree byte lengths like a B-tree, touching only the nodes along the path.
