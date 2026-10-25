@@ -52,6 +52,10 @@ impl SymbolId {
     }
 }
 
+/// Largest `Run` repetition count representable in the on-disk `.btlk` rule format
+/// (`PackedRuleNode` stores it in a `u32`). Larger repetitions are built from nested runs.
+pub const MAX_RUN_COUNT: u64 = u32::MAX as u64;
+
 /// Canonical production rule for a non-terminal symbol.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleKind {
@@ -83,6 +87,41 @@ pub struct RootEntry {
     pub root_symbol: Option<SymbolId>,
     pub byte_len: u64,
     pub kr_hash: u64,
+}
+
+/// Given `out[start..]` holding one copy of a piece, appends copies until it holds `count` copies
+/// in total, doubling the copied span each step.
+#[inline]
+pub(crate) fn repeat_tail(out: &mut Vec<u8>, start: usize, count: u64) {
+    let piece_len = out.len() - start;
+    if piece_len == 0 || count <= 1 {
+        return;
+    }
+    out.reserve(piece_len.saturating_mul(count as usize - 1));
+    let mut copied = 1u64;
+    while copied < count {
+        let to_copy = copied.min(count - copied);
+        out.extend_from_within(start..start + (to_copy as usize) * piece_len);
+        copied += to_copy;
+    }
+}
+
+/// Index of the root named `doc_name`, or of the first root if `doc_name` is `None`.
+pub(crate) fn find_root_index(roots: &[RootEntry], doc_name: Option<&str>) -> Result<usize> {
+    match doc_name {
+        Some(name) => roots
+            .iter()
+            .position(|r| r.name == name)
+            .ok_or_else(|| ButtlickError::DocumentNotFound(name.to_string())),
+        None if roots.is_empty() => Err(ButtlickError::DocumentNotFound("<default>".to_string())),
+        None => Ok(0),
+    }
+}
+
+/// Finds the root named `doc_name`, or the first root if `doc_name` is `None`.
+#[inline]
+pub(crate) fn find_root_in<'a>(roots: &'a [RootEntry], doc_name: Option<&str>) -> Result<&'a RootEntry> {
+    find_root_index(roots, doc_name).map(|idx| &roots[idx])
 }
 
 /// Lazy append-only cache of `(kr_hash, kr_pow)` per rule in `GrammarDag::rules`.
@@ -244,31 +283,21 @@ impl GrammarDag {
 
     /// Finds a `RootEntry` by name, or returns the first root if `doc_name` is `None`.
     pub fn find_root(&self, doc_name: Option<&str>) -> Result<&RootEntry> {
-        match doc_name {
-            Some(name) => self
-                .roots
-                .iter()
-                .find(|r| r.name == name)
-                .ok_or_else(|| ButtlickError::DocumentNotFound(name.to_string())),
-            None => self
-                .roots
-                .first()
-                .ok_or_else(|| ButtlickError::DocumentNotFound("<default>".to_string())),
-        }
+        find_root_in(&self.roots, doc_name)
     }
 
     /// Finds a mutable `RootEntry` by name, or returns the first root if `doc_name` is `None`.
     pub fn find_root_mut(&mut self, doc_name: Option<&str>) -> Result<&mut RootEntry> {
-        match doc_name {
-            Some(name) => self
-                .roots
-                .iter_mut()
-                .find(|r| r.name == name)
-                .ok_or_else(|| ButtlickError::DocumentNotFound(name.to_string())),
-            None => self
-                .roots
-                .first_mut()
-                .ok_or_else(|| ButtlickError::DocumentNotFound("<default>".to_string())),
+        let idx = find_root_index(&self.roots, doc_name)?;
+        Ok(&mut self.roots[idx])
+    }
+
+    /// Replaces the root named `entry.name` if present, otherwise appends `entry`.
+    pub(crate) fn upsert_root(&mut self, entry: RootEntry) {
+        if let Some(existing) = self.roots.iter_mut().find(|r| r.name == entry.name) {
+            *existing = entry;
+        } else {
+            self.roots.push(entry);
         }
     }
 

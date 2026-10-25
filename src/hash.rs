@@ -107,15 +107,11 @@ pub fn raw_slice_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Deterministic 64-bit bijective SplitMix64 hash for Locally Consistent Parsing landmarks.
-/// Assigns newline (`\n` = 10) the minimum possible priority 0 so line boundaries act as
-/// natural synchronization points at Level 0.
+/// Deterministic 64-bit SplitMix64 finalizer, remapped so that it never returns 0
+/// (0 is reserved as the minimum landmark priority of `\n`).
 #[inline(always)]
-pub const fn landmark_hash(sym: SymbolId) -> u64 {
-    if sym.0 == b'\n' as u32 {
-        return 0;
-    }
-    let mut z = (sym.0 as u64).wrapping_add(0x9e3779b97f4a7c15);
+pub const fn splitmix64_non_zero(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
     let val = z ^ (z >> 31);
@@ -124,6 +120,17 @@ pub const fn landmark_hash(sym: SymbolId) -> u64 {
     } else {
         val
     }
+}
+
+/// Deterministic 64-bit bijective SplitMix64 hash for Locally Consistent Parsing landmarks.
+/// Assigns newline (`\n` = 10) the minimum possible priority 0 so line boundaries act as
+/// natural synchronization points at Level 0.
+#[inline(always)]
+pub const fn landmark_hash(sym: SymbolId) -> u64 {
+    if sym.0 == b'\n' as u32 {
+        return 0;
+    }
+    splitmix64_non_zero(sym.0 as u64)
 }
 
 /// Fast, deterministic 64-bit checksum over an arbitrary byte slice for file headers and footers.

@@ -1,4 +1,5 @@
 pub mod header;
+pub mod mapped;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -12,7 +13,7 @@ use crate::format::header::{
     BtlkHeader, PackedRuleNode, BTLK_HEADER_SIZE, BTLK_VERSION_V1, FLAG_LINE_ANCHORED_LCP,
     PACKED_RULE_SIZE,
 };
-use crate::grammar::{GrammarDag, RootEntry, RuleKind, RuleNode, SymbolId};
+use crate::grammar::{find_root_in, GrammarDag, RootEntry, RuleKind, RuleNode, SymbolId};
 use crate::hash::checksum64;
 
 /// Streaming checksum writer that computes `checksum64` on the fly without buffering the entire file in RAM.
@@ -85,7 +86,124 @@ impl<W: Write> ChecksumWriter<W> {
     }
 }
 
+/// Validated byte layout of a `.btlk` v1 archive (header + parsed root table + rule table bounds).
+struct BtlkLayout {
+    roots: Vec<RootEntry>,
+    rules_offset: usize,
+    rules_end: usize,
+    num_rules: usize,
+}
+
+impl BtlkLayout {
+    /// Parses and validates the header, section offsets, and root table of a `.btlk` v1 archive.
+    /// Does NOT verify the footer checksum (callers decide whether to pay for a full-file scan).
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < BTLK_HEADER_SIZE + 8 {
+            return Err(ButtlickError::CorruptedFormat(format!(
+                "File too small: {} bytes",
+                bytes.len()
+            )));
+        }
+
+        let header = BtlkHeader::from_bytes(&bytes[0..BTLK_HEADER_SIZE])?;
+        let payload_end = bytes.len() - 8;
+        let roots_offset = header.roots_offset as usize;
+        let rules_offset = header.rules_offset as usize;
+        let num_rules = header.num_rules as usize;
+        let expected_rules_end = rules_offset
+            .checked_add(num_rules.checked_mul(PACKED_RULE_SIZE).ok_or_else(|| {
+                ButtlickError::CorruptedFormat("Rule table size overflow".into())
+            })?)
+            .ok_or_else(|| ButtlickError::CorruptedFormat("Rule offset overflow".into()))?;
+
+        if roots_offset != BTLK_HEADER_SIZE
+            || rules_offset < roots_offset
+            || !rules_offset.is_multiple_of(8)
+            || expected_rules_end != payload_end
+        {
+            return Err(ButtlickError::CorruptedFormat(
+                "Invalid section offsets in .btlk header".into(),
+            ));
+        }
+
+        // Symbols must reference either a terminal byte or an existing rule.
+        let max_sym = SymbolId::from_rule_index(num_rules).0 as u64;
+        let mut cursor = roots_offset;
+        // Each root entry occupies at least 32 bytes, so cap the reservation by the section size
+        // to avoid huge allocations from a corrupted `num_roots` field.
+        let max_roots = (rules_offset - roots_offset) / 32;
+        let mut roots = Vec::with_capacity((header.num_roots as usize).min(max_roots));
+        for _ in 0..header.num_roots {
+            if cursor + 32 > rules_offset {
+                return Err(ButtlickError::CorruptedFormat(
+                    "Truncated root entry header".into(),
+                ));
+            }
+            let name_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let has_symbol = bytes[cursor + 4];
+            let sym_raw = u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap());
+            let byte_len = u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap());
+            let kr_hash = u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap());
+            cursor += 32;
+
+            if name_len > rules_offset - cursor {
+                return Err(ButtlickError::CorruptedFormat(
+                    "Truncated root entry name".into(),
+                ));
+            }
+            let name = std::str::from_utf8(&bytes[cursor..cursor + name_len])
+                .map_err(|e| {
+                    ButtlickError::CorruptedFormat(format!("Invalid UTF-8 root name: {e}"))
+                })?
+                .to_string();
+            cursor += name_len;
+
+            let root_symbol = if has_symbol == 0 {
+                None
+            } else {
+                if sym_raw as u64 >= max_sym {
+                    return Err(ButtlickError::CorruptedFormat(format!(
+                        "Root '{name}' references out-of-range symbol {sym_raw}"
+                    )));
+                }
+                Some(SymbolId(sym_raw))
+            };
+            roots.push(RootEntry {
+                name,
+                root_symbol,
+                byte_len,
+                kr_hash,
+            });
+        }
+
+        Ok(Self {
+            roots,
+            rules_offset,
+            rules_end: expected_rules_end,
+            num_rules,
+        })
+    }
+}
+
 impl GrammarDag {
+    fn btlk_header(&self, roots_section_len: usize) -> (BtlkHeader, usize) {
+        let roots_offset = BTLK_HEADER_SIZE as u64;
+        let rules_offset = roots_offset + (roots_section_len as u64);
+        let payload_size = (rules_offset as usize) + self.rules.len() * PACKED_RULE_SIZE;
+        let header = BtlkHeader {
+            version: BTLK_VERSION_V1,
+            flags: FLAG_LINE_ANCHORED_LCP,
+            num_roots: self.roots.len() as u64,
+            num_rules: self.rules.len() as u64,
+            roots_offset,
+            rules_offset,
+            total_uncompressed_bytes: self.total_uncompressed_bytes(),
+            header_checksum: 0,
+        };
+        (header, payload_size)
+    }
+
     fn encode_roots_section(&self) -> Vec<u8> {
         let mut roots_buf = Vec::with_capacity(self.roots.len() * 48);
         for root in &self.roots {
@@ -112,65 +230,29 @@ impl GrammarDag {
 
     /// Serializes this `GrammarDag` into a `.btlk` v1 byte vector in memory.
     pub fn to_btlk_bytes(&self) -> Vec<u8> {
-        let roots_buf = self.encode_roots_section();
-        let roots_offset = BTLK_HEADER_SIZE as u64;
-        let rules_offset = roots_offset + (roots_buf.len() as u64);
-        let rules_bytes_len = self.rules.len() * PACKED_RULE_SIZE;
-        let payload_size = (rules_offset as usize) + rules_bytes_len;
-
-        let header = BtlkHeader {
-            version: BTLK_VERSION_V1,
-            flags: FLAG_LINE_ANCHORED_LCP,
-            num_roots: self.roots.len() as u64,
-            num_rules: self.rules.len() as u64,
-            roots_offset,
-            rules_offset,
-            total_uncompressed_bytes: self.total_uncompressed_bytes(),
-            header_checksum: 0,
-        };
-
-        let out_vec = Vec::with_capacity(payload_size + 8);
-        let mut writer = ChecksumWriter::new(out_vec, payload_size);
-        writer.write_payload(&header.to_bytes()).unwrap();
-        writer.write_payload(&roots_buf).unwrap();
-        let mut chunk_buf = Vec::with_capacity(64 * 1024);
-        for node in &self.rules {
-            let packed = PackedRuleNode::from_rule_node(node);
-            chunk_buf.extend_from_slice(&packed.to_bytes());
-            if chunk_buf.len() >= 64 * 1024 {
-                writer.write_payload(&chunk_buf).unwrap();
-                chunk_buf.clear();
-            }
-        }
-        if !chunk_buf.is_empty() {
-            writer.write_payload(&chunk_buf).unwrap();
-        }
-        writer.finish_and_write_footer().unwrap()
+        let roots_len: usize = self.roots.iter().map(|r| 32 + r.name.len()).sum();
+        let capacity =
+            BTLK_HEADER_SIZE + roots_len.next_multiple_of(8) + self.rules.len() * PACKED_RULE_SIZE + 8;
+        // Writing into a `Vec<u8>` is infallible.
+        self.write_btlk(Vec::with_capacity(capacity))
+            .expect("in-memory write cannot fail")
     }
 
     /// Streams this `GrammarDag` directly to a `.btlk` file on disk using an 8 MB `BufWriter`
     /// with zero duplicate full-archive memory allocation.
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
-        let roots_buf = self.encode_roots_section();
-        let roots_offset = BTLK_HEADER_SIZE as u64;
-        let rules_offset = roots_offset + (roots_buf.len() as u64);
-        let rules_bytes_len = self.rules.len() * PACKED_RULE_SIZE;
-        let payload_size = (rules_offset as usize) + rules_bytes_len;
-
-        let header = BtlkHeader {
-            version: BTLK_VERSION_V1,
-            flags: FLAG_LINE_ANCHORED_LCP,
-            num_roots: self.roots.len() as u64,
-            num_rules: self.rules.len() as u64,
-            roots_offset,
-            rules_offset,
-            total_uncompressed_bytes: self.total_uncompressed_bytes(),
-            header_checksum: 0,
-        };
-
         let file = File::create(path)?;
         let buf_writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
-        let mut writer = ChecksumWriter::new(buf_writer, payload_size);
+        let _ = self.write_btlk(buf_writer)?;
+        Ok(())
+    }
+
+    /// Serializes the archive (header, root table, packed rule table, footer checksum) into `inner`.
+    fn write_btlk<W: Write>(&self, inner: W) -> std::io::Result<W> {
+        let roots_buf = self.encode_roots_section();
+        let (header, payload_size) = self.btlk_header(roots_buf.len());
+
+        let mut writer = ChecksumWriter::new(inner, payload_size);
         writer.write_payload(&header.to_bytes())?;
         writer.write_payload(&roots_buf)?;
         const BATCH_RULES: usize = 2_097_152;
@@ -178,26 +260,25 @@ impl GrammarDag {
         for rules_batch in self.rules.chunks(BATCH_RULES) {
             let byte_len = rules_batch.len() * PACKED_RULE_SIZE;
             let dst_slice = &mut chunk_buf[..byte_len];
+            let pack = |dst_chunk: &mut [u8], node_chunk: &[RuleNode]| {
+                for (dst, node) in dst_chunk
+                    .chunks_exact_mut(PACKED_RULE_SIZE)
+                    .zip(node_chunk.iter())
+                {
+                    dst.copy_from_slice(&PackedRuleNode::from_rule_node(node).to_bytes());
+                }
+            };
             if rules_batch.len() >= 16_384 {
                 dst_slice
                     .par_chunks_mut(4096 * PACKED_RULE_SIZE)
                     .zip(rules_batch.par_chunks(4096))
-                    .for_each(|(dst_chunk, node_chunk)| {
-                        for (dst, node) in dst_chunk.chunks_exact_mut(8).zip(node_chunk.iter()) {
-                            let packed = PackedRuleNode::from_rule_node(node);
-                            dst.copy_from_slice(&packed.to_bytes());
-                        }
-                    });
+                    .for_each(|(dst_chunk, node_chunk)| pack(dst_chunk, node_chunk));
             } else {
-                for (dst, node) in dst_slice.chunks_exact_mut(8).zip(rules_batch.iter()) {
-                    let packed = PackedRuleNode::from_rule_node(node);
-                    dst.copy_from_slice(&packed.to_bytes());
-                }
+                pack(dst_slice, rules_batch);
             }
             writer.write_payload(dst_slice)?;
         }
-        let _ = writer.finish_and_write_footer()?;
-        Ok(())
+        writer.finish_and_write_footer()
     }
 
     /// Deserializes a `GrammarDag` from a `.btlk` v1 byte slice (or memory-mapped file),
@@ -210,8 +291,9 @@ impl GrammarDag {
             )));
         }
 
-        let header = BtlkHeader::from_bytes(&bytes[0..BTLK_HEADER_SIZE])?;
-
+        // Validate the header checksum first, then the whole-file footer checksum, so that
+        // corruption is reported as a checksum mismatch before any structural parsing.
+        BtlkHeader::from_bytes(&bytes[0..BTLK_HEADER_SIZE])?;
         let payload_end = bytes.len() - 8;
         let expected_footer = checksum64(&bytes[0..payload_end]);
         let actual_footer = u64::from_le_bytes(bytes[payload_end..].try_into().unwrap());
@@ -223,66 +305,12 @@ impl GrammarDag {
             });
         }
 
-        let roots_offset = header.roots_offset as usize;
-        let rules_offset = header.rules_offset as usize;
-        let num_rules = header.num_rules as usize;
-        let expected_rules_end = rules_offset
-            .checked_add(num_rules.checked_mul(PACKED_RULE_SIZE).ok_or_else(|| {
-                ButtlickError::CorruptedFormat("Rule table size overflow".into())
-            })?)
-            .ok_or_else(|| ButtlickError::CorruptedFormat("Rule offset overflow".into()))?;
-
-        if roots_offset != BTLK_HEADER_SIZE
-            || rules_offset < roots_offset
-            || !rules_offset.is_multiple_of(8)
-            || expected_rules_end != payload_end
-        {
-            return Err(ButtlickError::CorruptedFormat(
-                "Invalid section offsets in .btlk header".into(),
-            ));
-        }
-
-        // Parse Root Table Section
-        let mut cursor = roots_offset;
-        let mut roots = Vec::with_capacity(header.num_roots as usize);
-        for _ in 0..header.num_roots {
-            if cursor + 32 > rules_offset {
-                return Err(ButtlickError::CorruptedFormat(
-                    "Truncated root entry header".into(),
-                ));
-            }
-            let name_len =
-                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-            let has_symbol = bytes[cursor + 4];
-            let sym_raw = u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap());
-            let byte_len = u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap());
-            let kr_hash = u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap());
-            cursor += 32;
-
-            if cursor + name_len > rules_offset {
-                return Err(ButtlickError::CorruptedFormat(
-                    "Truncated root entry name".into(),
-                ));
-            }
-            let name = std::str::from_utf8(&bytes[cursor..cursor + name_len])
-                .map_err(|e| {
-                    ButtlickError::CorruptedFormat(format!("Invalid UTF-8 root name: {e}"))
-                })?
-                .to_string();
-            cursor += name_len;
-
-            let root_symbol = if has_symbol == 0 {
-                None
-            } else {
-                Some(SymbolId(sym_raw))
-            };
-            roots.push(RootEntry {
-                name,
-                root_symbol,
-                byte_len,
-                kr_hash,
-            });
-        }
+        let BtlkLayout {
+            roots,
+            rules_offset,
+            rules_end: expected_rules_end,
+            num_rules,
+        } = BtlkLayout::parse(bytes)?;
 
         // Parse Packed Rule Table Section in topological order
         let mut rules: Vec<RuleNode> = Vec::with_capacity(num_rules);
@@ -370,84 +398,26 @@ pub struct MappedArchive {
 }
 
 impl MappedArchive {
+    /// Memory-maps a `.btlk` archive and parses its root table.
+    ///
+    /// Unlike [`GrammarDag::load_from_path`], this does not verify the whole-file footer checksum
+    /// (that would require touching every page of the archive). Rule-table structure is validated
+    /// lazily by the query routines instead.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let bytes = &mmap[..];
-        if bytes.len() < BTLK_HEADER_SIZE + 8 {
-            return Err(ButtlickError::CorruptedFormat(format!(
-                "File too small: {} bytes",
-                bytes.len()
-            )));
-        }
-
-        let header = BtlkHeader::from_bytes(&bytes[0..BTLK_HEADER_SIZE])?;
-        let payload_end = bytes.len() - 8;
-        let roots_offset = header.roots_offset as usize;
-        let rules_offset = header.rules_offset as usize;
-        let num_rules = header.num_rules as usize;
-        let expected_rules_end = rules_offset
-            .checked_add(num_rules.checked_mul(PACKED_RULE_SIZE).ok_or_else(|| {
-                ButtlickError::CorruptedFormat("Rule table size overflow".into())
-            })?)
-            .ok_or_else(|| ButtlickError::CorruptedFormat("Rule offset overflow".into()))?;
-
-        if roots_offset != BTLK_HEADER_SIZE
-            || rules_offset < roots_offset
-            || !rules_offset.is_multiple_of(8)
-            || expected_rules_end != payload_end
-        {
-            return Err(ButtlickError::CorruptedFormat(
-                "Invalid section offsets in .btlk header".into(),
-            ));
-        }
-
-        let mut cursor = roots_offset;
-        let mut roots = Vec::with_capacity(header.num_roots as usize);
-        for _ in 0..header.num_roots {
-            if cursor + 32 > rules_offset {
-                return Err(ButtlickError::CorruptedFormat(
-                    "Truncated root entry header".into(),
-                ));
-            }
-            let name_len =
-                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-            let has_symbol = bytes[cursor + 4];
-            let sym_raw = u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap());
-            let byte_len = u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap());
-            let kr_hash = u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap());
-            cursor += 32;
-
-            if cursor + name_len > rules_offset {
-                return Err(ButtlickError::CorruptedFormat(
-                    "Truncated root entry name".into(),
-                ));
-            }
-            let name = std::str::from_utf8(&bytes[cursor..cursor + name_len])
-                .map_err(|e| {
-                    ButtlickError::CorruptedFormat(format!("Invalid UTF-8 root name: {e}"))
-                })?
-                .to_string();
-            cursor += name_len;
-
-            let root_symbol = if has_symbol == 0 {
-                None
-            } else {
-                Some(SymbolId(sym_raw))
-            };
-            roots.push(RootEntry {
-                name,
-                root_symbol,
-                byte_len,
-                kr_hash,
-            });
-        }
+        let BtlkLayout {
+            roots,
+            rules_offset,
+            rules_end,
+            num_rules,
+        } = BtlkLayout::parse(&mmap)?;
 
         Ok(Self {
             mmap,
             roots,
             rules_offset,
-            rules_end: expected_rules_end,
+            rules_end,
             num_rules,
         })
     }
@@ -458,16 +428,12 @@ impl MappedArchive {
     }
 
     pub fn find_root(&self, doc_name: Option<&str>) -> Result<&RootEntry> {
-        match doc_name {
-            Some(name) => self
-                .roots
-                .iter()
-                .find(|r| r.name == name)
-                .ok_or_else(|| ButtlickError::DocumentNotFound(name.to_string())),
-            None => self.roots.first().ok_or_else(|| {
-                ButtlickError::DocumentNotFound("<empty archive>".to_string())
-            }),
-        }
+        find_root_in(&self.roots, doc_name)
+    }
+
+    /// Fully decodes the archive into an in-memory `GrammarDag` (verifying the footer checksum).
+    pub fn load_grammar_dag(&self) -> Result<GrammarDag> {
+        GrammarDag::from_btlk_bytes(&self.mmap)
     }
 }
 

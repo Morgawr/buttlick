@@ -242,18 +242,13 @@ impl GrammarDag {
             Some(s) => (self.sym_len(s), self.sym_hash(s)),
             None => (0, 0),
         };
-        let name = new_name.into();
         let entry = RootEntry {
-            name: name.clone(),
+            name: new_name.into(),
             root_symbol: new_sym,
             byte_len,
             kr_hash,
         };
-        if let Some(existing) = self.roots.iter_mut().find(|r| r.name == name) {
-            *existing = entry.clone();
-        } else {
-            self.roots.push(entry.clone());
-        }
+        self.upsert_root(entry.clone());
         Ok(entry)
     }
 

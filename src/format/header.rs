@@ -102,10 +102,16 @@ impl PackedRuleNode {
                 word0: left.0,
                 word1: right.0,
             },
-            RuleKind::Run { child, count } => Self {
-                word0: child.0 | Self::RUN_TAG_BIT,
-                word1: count as u32,
-            },
+            RuleKind::Run { child, count } => {
+                debug_assert!(
+                    count <= u32::MAX as u64,
+                    "Run count {count} does not fit the on-disk u32 field"
+                );
+                Self {
+                    word0: child.0 | Self::RUN_TAG_BIT,
+                    word1: count as u32,
+                }
+            }
         }
     }
 
@@ -123,6 +129,24 @@ impl PackedRuleNode {
             word0: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             word1: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
         }
+    }
+
+    /// Reads the packed rule at `rule_idx` from a raw on-disk rule table.
+    #[inline(always)]
+    pub fn read_at(rules_bytes: &[u8], rule_idx: usize) -> Self {
+        let off = rule_idx * PACKED_RULE_SIZE;
+        Self::from_bytes(rules_bytes[off..off + PACKED_RULE_SIZE].try_into().unwrap())
+    }
+
+    #[inline(always)]
+    pub const fn is_run(&self) -> bool {
+        self.word0 & Self::RUN_TAG_BIT != 0
+    }
+
+    /// The `left` symbol of a `Pair`, or the `child` symbol of a `Run`.
+    #[inline(always)]
+    pub const fn first_sym(&self) -> SymbolId {
+        SymbolId(self.word0 & !Self::RUN_TAG_BIT)
     }
 
     #[inline(always)]

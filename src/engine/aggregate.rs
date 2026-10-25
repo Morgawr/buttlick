@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::grammar::{GrammarDag, RuleKind};
+use crate::format::mapped::MappedMeta;
+use crate::format::MappedArchive;
+use crate::grammar::{GrammarDag, RuleKind, SymbolId};
 
 /// Algebra 3A: The Affine Base-10 Place-Value Monoid over digit fragments.
 /// Represents a contiguous ASCII digit sequence $d_1 d_2 \dots d_m$ as $(v, 10^m)$
@@ -226,152 +228,225 @@ pub fn parse_int_affine(mut bytes: &[u8]) -> Option<i64> {
     i64::try_from(signed).ok()
 }
 
-/// Homomorphic summary of a grammar node $X$ for structured line-record aggregation.
-#[derive(Clone, Debug)]
-enum NodeRecordSummary {
-    /// Node expansion contains zero `\n` bytes (pure intra-line fragment).
-    NoNewline(Vec<u8>),
-    /// Node expansion contains at least one `\n` byte:
-    /// `prefix \n [middle complete lines] suffix`
-    HasNewline {
-        prefix: Vec<u8>,
-        middle: AggregateSummary,
-        suffix: Vec<u8>,
-    },
+/// Homomorphic summary of a grammar node $X$ whose expansion contains at least one `\n`:
+/// `prefix \n [middle complete lines] \n suffix`.
+///
+/// The partial first/last lines are NOT stored: they are byte ranges of $X$'s own expansion
+/// (`[0, first_nl)` and `[last_nl + 1, len)`) and are only materialized, straight from the grammar,
+/// when two such partial lines meet at a seam. Nodes without any `\n` need no summary at all.
+#[derive(Copy, Clone, Debug)]
+struct LineSpan {
+    /// Offset of the first `\n` in the expansion.
+    first_nl: u64,
+    /// Offset of the last `\n` in the expansion.
+    last_nl: u64,
+    /// Aggregate over all complete lines strictly between the first and last `\n`, as an index
+    /// into the `middles` table (`0` = empty aggregate, by far the most common case).
+    middle: u32,
 }
 
-impl NodeRecordSummary {
+/// Read access to a topologically ordered rule table, as needed by the record aggregation.
+pub(crate) trait RuleSource {
+    fn num_rules(&self) -> usize;
+    fn rule_kind(&mut self, idx: usize) -> Result<RuleKind>;
+    fn sym_len(&mut self, sym: SymbolId) -> Result<u64>;
+    /// Appends bytes `[start, end)` of `sym`'s expansion to `out`.
+    fn append_range(&mut self, sym: SymbolId, start: u64, end: u64, out: &mut Vec<u8>)
+        -> Result<()>;
+}
+
+/// `RuleSource` over a fully decoded `GrammarDag`.
+struct DagSource<'a>(&'a GrammarDag);
+
+impl RuleSource for DagSource<'_> {
+    fn num_rules(&self) -> usize {
+        self.0.rules.len()
+    }
     #[inline]
-    fn from_terminal(b: u8) -> Self {
-        if b == b'\n' {
-            Self::HasNewline {
-                prefix: Vec::new(),
-                middle: AggregateSummary::empty(),
-                suffix: Vec::new(),
+    fn rule_kind(&mut self, idx: usize) -> Result<RuleKind> {
+        Ok(self.0.rules[idx].kind)
+    }
+    #[inline]
+    fn sym_len(&mut self, sym: SymbolId) -> Result<u64> {
+        Ok(self.0.sym_len(sym))
+    }
+    fn append_range(
+        &mut self,
+        sym: SymbolId,
+        start: u64,
+        end: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        if start < end {
+            self.0.extract_slice_symbol(sym, start, end - start, out);
+        }
+        Ok(())
+    }
+}
+
+/// Marks every rule reachable from `root` (bitset indexed by rule index).
+fn mark_reachable<S: RuleSource>(src: &mut S, root: SymbolId) -> Result<Vec<u64>> {
+    let mut bits = vec![0u64; src.num_rules().div_ceil(64)];
+    let mut stack = vec![root];
+    while let Some(sym) = stack.pop() {
+        if sym.is_terminal() {
+            continue;
+        }
+        let idx = sym.rule_index();
+        let (word, bit) = (idx / 64, 1u64 << (idx % 64));
+        if bits[word] & bit != 0 {
+            continue;
+        }
+        bits[word] |= bit;
+        match src.rule_kind(idx)? {
+            RuleKind::Pair { left, right } => {
+                stack.push(right);
+                stack.push(left);
             }
+            RuleKind::Run { child, .. } => stack.push(child),
+        }
+    }
+    Ok(bits)
+}
+
+/// Evaluates `query` over the document rooted at `root` in a single bottom-up pass over the
+/// rules (restricted to the rules reachable from `root` when `restrict_to_reachable` is set).
+pub(crate) fn aggregate_root<S: RuleSource>(
+    src: &mut S,
+    root: SymbolId,
+    query: &AggregateQuery,
+    restrict_to_reachable: bool,
+) -> Result<AggregateSummary> {
+    let num_evaluated = if root.is_terminal() {
+        0
+    } else {
+        root.rule_index() + 1
+    };
+    let reachable = if restrict_to_reachable && num_evaluated > 0 {
+        Some(mark_reachable(src, root)?)
+    } else {
+        None
+    };
+    // `slots[idx]` = 1 + index into `spans` for rules containing a '\n', `NO_SPAN` otherwise.
+    // `spans[0]` is the terminal '\n'; rules whose span equals a child's share the child's slot.
+    const NO_SPAN: u32 = 0;
+    const NEWLINE_SLOT: u32 = 1;
+    let mut slots = vec![NO_SPAN; num_evaluated];
+    let mut spans: Vec<LineSpan> = vec![LineSpan {
+        first_nl: 0,
+        last_nl: 0,
+        middle: 0,
+    }];
+    // `middles[0]` is the empty aggregate.
+    let mut middles: Vec<AggregateSummary> = vec![AggregateSummary::empty()];
+    let push_middle = |agg: AggregateSummary, middles: &mut Vec<AggregateSummary>| -> u32 {
+        if agg.count == 0 {
+            0
         } else {
-            Self::NoNewline(vec![b])
+            middles.push(agg);
+            (middles.len() - 1) as u32
+        }
+    };
+    let mut seam = Vec::with_capacity(256);
+
+    let slot_of = |sym: SymbolId, slots: &[u32]| -> u32 {
+        match sym.as_byte() {
+            Some(b'\n') => NEWLINE_SLOT,
+            Some(_) => NO_SPAN,
+            None => slots[sym.rule_index()],
+        }
+    };
+
+    for idx in 0..num_evaluated {
+        if let Some(bits) = &reachable {
+            if bits[idx / 64] & (1u64 << (idx % 64)) == 0 {
+                continue;
+            }
+        }
+        let span = match src.rule_kind(idx)? {
+            RuleKind::Pair { left, right } => {
+                match (slot_of(left, &slots), slot_of(right, &slots)) {
+                    (NO_SPAN, NO_SPAN) => None,
+                    (l_slot, NO_SPAN) => {
+                        // Same span as `left`: share its slot.
+                        slots[idx] = l_slot;
+                        None
+                    }
+                    (NO_SPAN, r_slot) => {
+                        let r = spans[r_slot as usize - 1];
+                        let l_len = src.sym_len(left)?;
+                        Some(LineSpan {
+                            first_nl: l_len + r.first_nl,
+                            last_nl: l_len + r.last_nl,
+                            middle: r.middle,
+                        })
+                    }
+                    (l_slot, r_slot) => {
+                        let (l, r) = (spans[l_slot as usize - 1], spans[r_slot as usize - 1]);
+                        let l_len = src.sym_len(left)?;
+                        seam.clear();
+                        src.append_range(left, l.last_nl + 1, l_len, &mut seam)?;
+                        src.append_range(right, 0, r.first_nl, &mut seam)?;
+                        let seam_agg = eval_single_line(&seam, query);
+                        let middle = middles[l.middle as usize]
+                            .combine(seam_agg)
+                            .combine(middles[r.middle as usize]);
+                        Some(LineSpan {
+                            first_nl: l.first_nl,
+                            last_nl: l_len + r.last_nl,
+                            middle: push_middle(middle, &mut middles),
+                        })
+                    }
+                }
+            }
+            RuleKind::Run { child, count } => match slot_of(child, &slots) {
+                NO_SPAN => None,
+                c_slot => {
+                    let c = spans[c_slot as usize - 1];
+                    let c_len = src.sym_len(child)?;
+                    seam.clear();
+                    src.append_range(child, c.last_nl + 1, c_len, &mut seam)?;
+                    src.append_range(child, 0, c.first_nl, &mut seam)?;
+                    let seam_agg = eval_single_line(&seam, query);
+                    let middle = middles[c.middle as usize]
+                        .scale(count)
+                        .combine(seam_agg.scale(count - 1));
+                    Some(LineSpan {
+                        first_nl: c.first_nl,
+                        last_nl: (count - 1) * c_len + c.last_nl,
+                        middle: push_middle(middle, &mut middles),
+                    })
+                }
+            },
+        };
+        if let Some(s) = span {
+            spans.push(s);
+            slots[idx] = spans.len() as u32;
         }
     }
 
-    fn combine(left: &Self, right: &Self, query: &AggregateQuery, seam_buf: &mut Vec<u8>) -> Self {
-        match (left, right) {
-            (Self::NoNewline(l), Self::NoNewline(r)) => {
-                let mut both = Vec::with_capacity(l.len() + r.len());
-                both.extend_from_slice(l);
-                both.extend_from_slice(r);
-                Self::NoNewline(both)
-            }
-            (
-                Self::NoNewline(l),
-                Self::HasNewline {
-                    prefix: rp,
-                    middle: rm,
-                    suffix: rs,
-                },
-            ) => {
-                let mut prefix = Vec::with_capacity(l.len() + rp.len());
-                prefix.extend_from_slice(l);
-                prefix.extend_from_slice(rp);
-                Self::HasNewline {
-                    prefix,
-                    middle: *rm,
-                    suffix: rs.clone(),
-                }
-            }
-            (
-                Self::HasNewline {
-                    prefix: lp,
-                    middle: lm,
-                    suffix: ls,
-                },
-                Self::NoNewline(r),
-            ) => {
-                let mut suffix = Vec::with_capacity(ls.len() + r.len());
-                suffix.extend_from_slice(ls);
-                suffix.extend_from_slice(r);
-                Self::HasNewline {
-                    prefix: lp.clone(),
-                    middle: *lm,
-                    suffix,
-                }
-            }
-            (
-                Self::HasNewline {
-                    prefix: lp,
-                    middle: lm,
-                    suffix: ls,
-                },
-                Self::HasNewline {
-                    prefix: rp,
-                    middle: rm,
-                    suffix: rs,
-                },
-            ) => {
-                seam_buf.clear();
-                seam_buf.extend_from_slice(ls);
-                seam_buf.extend_from_slice(rp);
-                let seam_agg = eval_single_line(seam_buf, query);
-                let middle = lm.combine(seam_agg).combine(*rm);
-                Self::HasNewline {
-                    prefix: lp.clone(),
-                    middle,
-                    suffix: rs.clone(),
-                }
-            }
+    let root_len = src.sym_len(root)?;
+    let mut line = Vec::new();
+    Ok(match slot_of(root, &slots) {
+        // A single (unterminated) line spanning the whole document.
+        NO_SPAN => {
+            src.append_range(root, 0, root_len, &mut line)?;
+            eval_single_line(&line, query)
         }
-    }
-
-    fn power(&self, k: u64, query: &AggregateQuery, seam_buf: &mut Vec<u8>) -> Self {
-        debug_assert!(k >= 1);
-        if k == 1 {
-            return self.clone();
+        slot => {
+            let s = spans[slot as usize - 1];
+            src.append_range(root, 0, s.first_nl, &mut line)?;
+            let first = eval_single_line(&line, query);
+            let last = if s.last_nl + 1 < root_len {
+                line.clear();
+                src.append_range(root, s.last_nl + 1, root_len, &mut line)?;
+                eval_single_line(&line, query)
+            } else {
+                AggregateSummary::empty()
+            };
+            first.combine(middles[s.middle as usize]).combine(last)
         }
-        match self {
-            Self::NoNewline(frag) => Self::NoNewline(frag.repeat(k as usize)),
-            Self::HasNewline {
-                prefix,
-                middle,
-                suffix,
-            } => {
-                seam_buf.clear();
-                seam_buf.extend_from_slice(suffix);
-                seam_buf.extend_from_slice(prefix);
-                let seam_agg = eval_single_line(seam_buf, query);
-                let total_middle = middle.scale(k).combine(seam_agg.scale(k - 1));
-                Self::HasNewline {
-                    prefix: prefix.clone(),
-                    middle: total_middle,
-                    suffix: suffix.clone(),
-                }
-            }
-        }
-    }
-
-    fn finalize_root(&self, query: &AggregateQuery) -> AggregateSummary {
-        match self {
-            Self::NoNewline(frag) => {
-                if frag.is_empty() {
-                    AggregateSummary::empty()
-                } else {
-                    eval_single_line(frag, query)
-                }
-            }
-            Self::HasNewline {
-                prefix,
-                middle,
-                suffix,
-            } => {
-                let first = eval_single_line(prefix, query);
-                let last = if suffix.is_empty() {
-                    AggregateSummary::empty()
-                } else {
-                    eval_single_line(suffix, query)
-                };
-                first.combine(*middle).combine(last)
-            }
-        }
-    }
+    })
 }
 
 impl GrammarDag {
@@ -386,49 +461,60 @@ impl GrammarDag {
         let Some(root_sym) = root.root_symbol else {
             return Ok(AggregateSummary::empty());
         };
-        if let Some(b) = root_sym.as_byte() {
-            return Ok(NodeRecordSummary::from_terminal(b).finalize_root(query));
-        }
+        aggregate_root(&mut DagSource(self), root_sym, query, self.roots.len() > 1)
+    }
+}
 
-        let mut summaries: Vec<NodeRecordSummary> = Vec::with_capacity(self.rules.len());
-        let mut seam_buf = Vec::with_capacity(256);
+/// `RuleSource` evaluated directly on a memory-mapped archive (lengths computed lazily).
+struct MappedSource<'a> {
+    archive: &'a MappedArchive,
+    meta: MappedMeta,
+}
 
-        for node in &self.rules {
-            let sum = match node.kind {
-                RuleKind::Pair { left, right } => match (left.as_byte(), right.as_byte()) {
-                    (Some(lb), Some(rb)) => {
-                        let ls = NodeRecordSummary::from_terminal(lb);
-                        let rs = NodeRecordSummary::from_terminal(rb);
-                        NodeRecordSummary::combine(&ls, &rs, query, &mut seam_buf)
-                    }
-                    (Some(lb), None) => {
-                        let ls = NodeRecordSummary::from_terminal(lb);
-                        let rs = &summaries[right.rule_index()];
-                        NodeRecordSummary::combine(&ls, rs, query, &mut seam_buf)
-                    }
-                    (None, Some(rb)) => {
-                        let ls = &summaries[left.rule_index()];
-                        let rs = NodeRecordSummary::from_terminal(rb);
-                        NodeRecordSummary::combine(ls, &rs, query, &mut seam_buf)
-                    }
-                    (None, None) => {
-                        let ls = &summaries[left.rule_index()];
-                        let rs = &summaries[right.rule_index()];
-                        NodeRecordSummary::combine(ls, rs, query, &mut seam_buf)
-                    }
-                },
-                RuleKind::Run { child, count } => {
-                    if let Some(b) = child.as_byte() {
-                        NodeRecordSummary::from_terminal(b).power(count, query, &mut seam_buf)
-                    } else {
-                        summaries[child.rule_index()].power(count, query, &mut seam_buf)
-                    }
-                }
-            };
-            summaries.push(sum);
-        }
+impl RuleSource for MappedSource<'_> {
+    fn num_rules(&self) -> usize {
+        self.archive.num_rules
+    }
+    #[inline]
+    fn rule_kind(&mut self, idx: usize) -> Result<RuleKind> {
+        Ok(self
+            .archive
+            .checked_rule(SymbolId::from_rule_index(idx))?
+            .decode_kind())
+    }
+    #[inline]
+    fn sym_len(&mut self, sym: SymbolId) -> Result<u64> {
+        self.archive.sym_len(sym, &mut self.meta)
+    }
+    fn append_range(
+        &mut self,
+        sym: SymbolId,
+        start: u64,
+        end: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.archive
+            .extract_range_into(sym, start, end, out, &mut self.meta)
+    }
+}
 
-        Ok(summaries[root_sym.rule_index()].finalize_root(query))
+impl MappedArchive {
+    /// Evaluates a structured aggregation query directly on the memory-mapped archive, visiting
+    /// only the rules reachable from the document's root.
+    pub fn aggregate_query(
+        &self,
+        doc_name: Option<&str>,
+        query: &AggregateQuery,
+    ) -> Result<AggregateSummary> {
+        let root = self.find_root(doc_name)?;
+        let Some(root_sym) = root.root_symbol else {
+            return Ok(AggregateSummary::empty());
+        };
+        let mut src = MappedSource {
+            archive: self,
+            meta: self.navigation_meta()?,
+        };
+        aggregate_root(&mut src, root_sym, query, self.roots.len() > 1)
     }
 }
 

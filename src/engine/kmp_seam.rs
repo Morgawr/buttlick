@@ -1,4 +1,6 @@
+use crate::engine::transducer::MealyTransducer;
 use crate::error::{ButtlickError, Result};
+use crate::format::MappedArchive;
 use crate::grammar::{GrammarDag, RuleKind, SymbolId};
 
 /// Builds the Knuth-Morris-Pratt (KMP) prefix-function (failure) table for `pattern` in O(m) time.
@@ -557,6 +559,129 @@ impl KmpDagIndex {
         total_sum
     }
 }
+
+/// Compiles `pattern` into a KMP-automaton `MealyTransducer` over states `0..m` (number of pattern
+/// bytes currently matched) that emits `1` on every byte completing an occurrence. Overlapping
+/// occurrences are included, so transducer-based evaluators count exactly what `kmp_count` counts.
+pub fn compile_literal_transducer(pattern: &[u8]) -> Result<MealyTransducer> {
+    if pattern.is_empty() {
+        return Err(ButtlickError::EmptyPattern);
+    }
+    let m = pattern.len();
+    if m > u16::MAX as usize {
+        return Err(ButtlickError::InvalidQuery(format!(
+            "literal pattern too long for a transducer ({m} bytes)"
+        )));
+    }
+    let pi = build_kmp_table(pattern);
+    let mut byte_next = vec![0u16; m * 256];
+    let mut byte_emit = vec![0u64; m * 256];
+    for q in 0..m {
+        for b in 0..=255u8 {
+            // Standard KMP automaton transition, built by dynamic programming over the failure
+            // links: `pi[q - 1] < q`, so its transitions are already final (and never the
+            // completing transition, which only exists for state `m - 1`).
+            let k = if pattern[q] == b {
+                q + 1
+            } else if q == 0 {
+                0
+            } else {
+                byte_next[pi[q - 1] * 256 + b as usize] as usize
+            };
+            let idx = q * 256 + b as usize;
+            if k == m {
+                byte_emit[idx] = 1;
+                byte_next[idx] = pi[m - 1] as u16;
+            } else {
+                byte_next[idx] = k as u16;
+            }
+        }
+    }
+    Ok(MealyTransducer {
+        num_states: m,
+        start_state: 0,
+        byte_next,
+        byte_emit,
+        eof_emit: vec![0u64; m],
+    })
+}
+
+impl MappedArchive {
+    /// Zero-copy exact substring count (overlapping occurrences) on a named document, evaluated
+    /// directly on the memory-mapped rule table with 1–2 bytes of state per symbol.
+    pub fn count_literal(&self, doc_name: Option<&str>, pattern: &[u8]) -> Result<u64> {
+        let root = self.find_root(doc_name)?;
+        if pattern.is_empty() {
+            return Err(ButtlickError::EmptyPattern);
+        }
+        if root.root_symbol.is_none() || (pattern.len() as u64) > root.byte_len {
+            return Ok(0);
+        }
+        Ok(self.count_literal_roots(pattern, &[root.root_symbol])?[0])
+    }
+
+    /// Zero-copy exact substring count across ALL documents in a single pass over the rule table.
+    pub fn count_literal_all_docs(&self, pattern: &[u8]) -> Result<Vec<(String, u64)>> {
+        if pattern.is_empty() {
+            return Err(ButtlickError::EmptyPattern);
+        }
+        let roots: Vec<Option<SymbolId>> = self.roots.iter().map(|r| r.root_symbol).collect();
+        let counts = self.count_literal_roots(pattern, &roots)?;
+        Ok(self
+            .roots
+            .iter()
+            .zip(counts)
+            .map(|(r, c)| (r.name.clone(), c))
+            .collect())
+    }
+
+    /// Zero-copy exact substring count plus the byte offsets of the first `limit` matches
+    /// (in increasing order) on a named document.
+    pub fn locate_literal(
+        &self,
+        doc_name: Option<&str>,
+        pattern: &[u8],
+        limit: usize,
+    ) -> Result<(u64, Vec<u64>)> {
+        let root = self.find_root(doc_name)?;
+        if pattern.is_empty() {
+            return Err(ButtlickError::EmptyPattern);
+        }
+        let Some(sym) = root.root_symbol else {
+            return Ok((0, Vec::new()));
+        };
+        if (pattern.len() as u64) > root.byte_len {
+            return Ok((0, Vec::new()));
+        }
+        if pattern.len() > MAX_MAPPED_LITERAL_LEN {
+            return self.load_grammar_dag()?.locate_literal(doc_name, pattern, limit);
+        }
+        let transducer = compile_literal_transducer(pattern)?;
+        let (count, match_ends) =
+            self.locate_emissions(&transducer, sym, limit, &String::from_utf8_lossy(pattern))?;
+        // The transducer emits on the last byte of each occurrence.
+        let m = pattern.len() as u64;
+        Ok((count, match_ends.into_iter().map(|end| end + 1 - m).collect()))
+    }
+
+    fn count_literal_roots(&self, pattern: &[u8], roots: &[Option<SymbolId>]) -> Result<Vec<u64>> {
+        if pattern.len() > MAX_MAPPED_LITERAL_LEN {
+            // Too many automaton states for the packed evaluators: fall back to the fully decoded
+            // KMP seam-tracking evaluation.
+            let dag = self.load_grammar_dag()?;
+            let index = KmpDagIndex::evaluate(&dag, pattern)?;
+            return Ok(roots
+                .iter()
+                .map(|r| r.map_or(0, |sym| index.count_symbol(sym)))
+                .collect());
+        }
+        let transducer = compile_literal_transducer(pattern)?;
+        self.count_emissions(&transducer, roots, &String::from_utf8_lossy(pattern))
+    }
+}
+
+/// Longest literal handled by the packed mmap evaluators (one automaton state per pattern byte).
+const MAX_MAPPED_LITERAL_LEN: usize = 0x8000;
 
 impl GrammarDag {
     /// Zero-decompression exact substring count on a named document in O(n * |P|) time.

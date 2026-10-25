@@ -1,4 +1,5 @@
 use crate::error::{ButtlickError, Result};
+use crate::grammar::repeat_tail;
 use crate::grammar::{GrammarDag, RuleKind, SymbolId};
 use crate::hash::{combine_hashes, repeat_hash_and_pow};
 
@@ -148,16 +149,7 @@ impl GrammarDag {
         for (piece_sym, repeat_count) in pieces {
             let start_pos = out.len();
             self.decompress_symbol_into(piece_sym, out);
-            let piece_len = out.len() - start_pos;
-            if repeat_count > 1 && piece_len > 0 {
-                let mut copied = 1u64;
-                while copied < repeat_count {
-                    let to_copy = copied.min(repeat_count - copied);
-                    let copy_bytes = (to_copy as usize) * piece_len;
-                    out.extend_from_within(start_pos..start_pos + copy_bytes);
-                    copied += to_copy;
-                }
-            }
+            repeat_tail(out, start_pos, repeat_count);
         }
     }
 
@@ -190,14 +182,11 @@ impl GrammarDag {
         self.decompose_range(sym, start, start + len, &mut pieces);
         let mut acc_hash = 0u64;
         for (piece_sym, repeat_count) in pieces {
+            let (hash, pow) = self.sym_hash_and_pow(piece_sym);
             let (p_hash, p_pow) = if repeat_count == 1 {
-                (self.sym_hash(piece_sym), self.sym_pow(piece_sym))
+                (hash, pow)
             } else {
-                repeat_hash_and_pow(
-                    self.sym_hash(piece_sym),
-                    self.sym_pow(piece_sym),
-                    repeat_count,
-                )
+                repeat_hash_and_pow(hash, pow, repeat_count)
             };
             acc_hash = combine_hashes(acc_hash, p_hash, p_pow);
         }

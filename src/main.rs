@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
@@ -374,6 +374,29 @@ fn parse_delimiter(s: &str) -> Result<u8> {
     }
 }
 
+/// Converts an archive document name into a relative path that cannot escape the extraction
+/// directory (rejects absolute paths, drive prefixes, and `..` components).
+fn safe_relative_path(name: &str) -> Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for comp in Path::new(name).components() {
+        match comp {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ButtlickError::CorruptedFormat(format!(
+                    "Refusing to extract document with unsafe path '{name}'"
+                )));
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(ButtlickError::CorruptedFormat(format!(
+            "Refusing to extract document with empty path '{name}'"
+        )));
+    }
+    Ok(out)
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -485,18 +508,32 @@ fn run() -> Result<()> {
             out_dir,
             doc,
         } => {
-            let dag = GrammarDag::load_from_path(&input)?;
+            // Expand directly from the memory-mapped rule table (no full `GrammarDag` decode),
+            // after verifying the whole-file checksum.
+            let archive = MappedArchive::open(&input)?;
+            archive.verify_checksum()?;
             if let Some(dir_path) = out_dir {
-                for root in &dag.roots {
-                    let target = dir_path.join(&root.name);
-                    if let Some(parent) = target.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    let bytes = dag.decompress(Some(&root.name))?;
-                    fs::write(target, &bytes)?;
-                }
+                // Validate every path before writing anything.
+                let targets: Vec<PathBuf> = archive
+                    .roots
+                    .iter()
+                    .map(|root| safe_relative_path(&root.name).map(|rel| dir_path.join(rel)))
+                    .collect::<Result<_>>()?;
+                archive
+                    .roots
+                    .par_iter()
+                    .zip(targets.par_iter())
+                    .try_for_each_init(Vec::new, |bytes, (root, target)| -> Result<()> {
+                        if let Some(parent) = target.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        bytes.clear();
+                        archive.decompress_root_into(root, bytes)?;
+                        fs::write(target, &bytes)?;
+                        Ok(())
+                    })?;
             } else {
-                let bytes = dag.decompress(doc.as_deref())?;
+                let bytes = archive.decompress(doc.as_deref())?;
                 match output {
                     Some(out_path) => fs::write(out_path, &bytes)?,
                     None => {
@@ -511,8 +548,8 @@ fn run() -> Result<()> {
 
         Commands::Inspect { input, json } => {
             let file_len = fs::metadata(&input)?.len();
-            let dag = GrammarDag::load_from_path(&input)?;
-            let rep = dag.inspect_report(Some(file_len));
+            let archive = MappedArchive::open(&input)?;
+            let rep = archive.inspect_report(file_len)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap());
             } else {
@@ -541,8 +578,9 @@ fn run() -> Result<()> {
             len,
             doc,
         } => {
-            let dag = GrammarDag::load_from_path(&input)?;
-            let slice = dag.extract_slice(doc.as_deref(), start, len)?;
+            // Random access on the memory-mapped archive: only the visited subtrees are touched.
+            let archive = MappedArchive::open(&input)?;
+            let slice = archive.extract_slice(doc.as_deref(), start, len)?;
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             handle.write_all(&slice)?;
@@ -556,8 +594,8 @@ fn run() -> Result<()> {
             len,
             doc,
         } => {
-            let dag = GrammarDag::load_from_path(&input)?;
-            let eq = dag.substring_eq(doc.as_deref(), pos1, pos2, len)?;
+            let archive = MappedArchive::open(&input)?;
+            let eq = archive.substring_eq(doc.as_deref(), pos1, pos2, len)?;
             println!("{eq}");
         }
 
@@ -569,9 +607,9 @@ fn run() -> Result<()> {
             doc,
             all,
         } => {
-            let dag = GrammarDag::load_from_path(&input)?;
             if all {
-                let results = dag.count_literal_all_docs(pattern.as_bytes())?;
+                let archive = MappedArchive::open(&input)?;
+                let results = archive.count_literal_all_docs(pattern.as_bytes())?;
                 let show_zeros = results.len() <= 16;
                 let mut total = 0u64;
                 for (name, c) in results {
@@ -582,13 +620,16 @@ fn run() -> Result<()> {
                 }
                 println!("TOTAL:{total}");
             } else if offsets {
-                let (count, locs) = dag.locate_literal(doc.as_deref(), pattern.as_bytes(), limit)?;
+                let archive = MappedArchive::open(&input)?;
+                let (count, locs) =
+                    archive.locate_literal(doc.as_deref(), pattern.as_bytes(), limit)?;
                 println!("{count}");
                 for off in locs {
                     println!("{off}");
                 }
             } else {
-                let count = dag.count_literal(doc.as_deref(), pattern.as_bytes())?;
+                let archive = MappedArchive::open(&input)?;
+                let count = archive.count_literal(doc.as_deref(), pattern.as_bytes())?;
                 println!("{count}");
             }
         }
@@ -695,13 +736,13 @@ fn run() -> Result<()> {
                     ))
                 }
             };
-            let dag = GrammarDag::load_from_path(&input)?;
+            let archive = MappedArchive::open(&input)?;
             let q = AggregateQuery {
                 delimiter: delim,
                 target_col: col,
                 filter,
             };
-            let res = dag.aggregate_query(doc.as_deref(), &q)?;
+            let res = archive.aggregate_query(doc.as_deref(), &q)?;
             if json {
                 let payload = serde_json::json!({
                     "count": res.count,

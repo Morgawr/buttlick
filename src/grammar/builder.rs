@@ -1,17 +1,24 @@
 use rustc_hash::FxHashMap;
 
-use crate::grammar::{RuleKind, RuleNode, SymbolId};
+use crate::grammar::{RuleKind, RuleNode, SymbolId, MAX_RUN_COUNT};
 
 pub const LINE_CACHE_SIZE: usize = 1 << 20;
 pub const LINE_CACHE_MASK: usize = LINE_CACHE_SIZE - 1;
 pub const SEEN_TABLE_SIZE: usize = 1 << 21;
 pub const SEEN_TABLE_MASK: usize = SEEN_TABLE_SIZE - 1;
 
+/// Returns true if a `Pair` rule with the given expansion length and last byte should be indexed
+/// in the global cross-chunk hash-consing table during bulk streaming ingestion.
+#[inline(always)]
+pub const fn is_globally_interned_pair(byte_len: u64, last_byte: u8) -> bool {
+    byte_len <= 16 || (byte_len <= 28 && last_byte != b'\n')
+}
+
 /// Returns true if a `Pair` rule should be indexed in the global cross-chunk hash-consing table
 /// during bulk streaming ingestion.
 #[inline(always)]
 pub const fn should_intern_pair_globally(node: &RuleNode) -> bool {
-    node.byte_len <= 16 || (node.byte_len <= 28 && node.last_byte != b'\n')
+    is_globally_interned_pair(node.byte_len, node.last_byte)
 }
 
 /// Canonical hash-consing table ensuring structural deduplication across the `GrammarDag`.
@@ -226,7 +233,24 @@ impl RuleInterner {
             return child;
         }
         let (base_child, base_count) = Self::as_run(rules, child);
-        let total_count = base_count.checked_mul(count).expect("byte_len overflow");
+        // Flatten `Run(Run(base, k), count)` into `Run(base, k * count)` unless that would exceed
+        // the on-disk `u32` run-count limit, in which case `child` is kept as a nested run.
+        let (base_child, total_count) = match base_count.checked_mul(count) {
+            Some(total) if total <= MAX_RUN_COUNT => (base_child, total),
+            _ => (child, count),
+        };
+        if total_count > MAX_RUN_COUNT {
+            // Build `Run(Run(child, MAX), q) ++ Run(child, r)`.
+            let full = self.intern_run(rules, base_child, MAX_RUN_COUNT);
+            let reps = self.intern_run(rules, full, total_count / MAX_RUN_COUNT);
+            return match total_count % MAX_RUN_COUNT {
+                0 => reps,
+                rem => {
+                    let tail = self.intern_run(rules, base_child, rem);
+                    self.intern_pair(rules, reps, tail)
+                }
+            };
+        }
 
         if let Some(&existing) = self.run_map.get(&(base_child, total_count)) {
             return existing;
@@ -263,7 +287,7 @@ impl RuleInterner {
     ) -> SymbolId {
         let (l_base, l_count) = Self::as_run(rules, left);
         let (r_base, r_count) = Self::as_run(rules, right);
-        if l_base == r_base {
+        if l_base == r_base && l_count + r_count <= MAX_RUN_COUNT {
             return self.intern_run(rules, l_base, l_count + r_count);
         }
 

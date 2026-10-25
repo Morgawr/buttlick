@@ -2,32 +2,141 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::error::Result;
-use crate::grammar::builder::{RuleInterner, LINE_CACHE_MASK, SEEN_TABLE_MASK};
-use crate::grammar::{GrammarDag, RootEntry, RuleKind, RuleNode, SymbolId};
-use crate::hash::{checksum64, combine_hashes, mod_pow, raw_slice_hash, HASH_BASE};
+use crate::grammar::builder::{
+    is_globally_interned_pair, RuleInterner, LINE_CACHE_MASK, SEEN_TABLE_MASK,
+};
+use crate::grammar::{repeat_tail, GrammarDag, RootEntry, RuleKind, RuleNode, SymbolId, MAX_RUN_COUNT};
+use crate::hash::{
+    checksum64, combine_hashes, landmark_hash, mod_pow, raw_slice_hash, splitmix64_non_zero,
+    HASH_BASE,
+};
 
 /// Target chunk size (256 KB) for parallel L2-cache-resident LCP compression.
 const PARALLEL_CHUNK_SIZE: usize = 256 * 1024;
 
-#[inline(always)]
-const fn splitmix64_non_zero(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9e3779b97f4a7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    let val = z ^ (z >> 31);
-    if val == 0 {
-        1
-    } else {
-        val
+/// Shared Locally Consistent Parsing (recompression) driver over a hash-consing rule builder.
+///
+/// Implementors only provide rule interning and the landmark priority function; the block and
+/// run contraction rounds are shared.
+trait LcpBuilder {
+    fn lcp_pair(&mut self, left: SymbolId, right: SymbolId) -> SymbolId;
+    fn lcp_run(&mut self, child: SymbolId, count: u64) -> SymbolId;
+    fn lcp_landmark(&self, sym: SymbolId) -> u64;
+
+    /// Builds `child^count` for `count > MAX_RUN_COUNT` (which cannot be stored as a single `Run`)
+    /// as `Run(Run(child, MAX_RUN_COUNT), q) ++ Run(child, r)`.
+    #[cold]
+    fn intern_oversized_run(&mut self, child: SymbolId, count: u64) -> SymbolId {
+        debug_assert!(count > MAX_RUN_COUNT);
+        let full = self.lcp_run(child, MAX_RUN_COUNT);
+        let reps = self.lcp_run(full, count / MAX_RUN_COUNT);
+        match count % MAX_RUN_COUNT {
+            0 => reps,
+            rem => {
+                let tail = self.lcp_run(child, rem);
+                self.lcp_pair(reps, tail)
+            }
+        }
+    }
+
+    /// Pairs up the symbols of a span between two landmarks (folding a trailing triple into
+    /// `((a b) c)`), appending the results to `out`.
+    #[inline]
+    fn contract_span(&mut self, span: &[SymbolId], out: &mut Vec<SymbolId>) {
+        let mut p = 0;
+        let len = span.len();
+        if len == 1 {
+            out.push(span[0]);
+            return;
+        }
+        while len - p > 3 {
+            let pair = self.lcp_pair(span[p], span[p + 1]);
+            out.push(pair);
+            p += 2;
+        }
+        match len - p {
+            2 => {
+                let pair = self.lcp_pair(span[p], span[p + 1]);
+                out.push(pair);
+            }
+            3 => {
+                let left = self.lcp_pair(span[p], span[p + 1]);
+                let triple = self.lcp_pair(left, span[p + 2]);
+                out.push(triple);
+            }
+            0 => {}
+            _ => unreachable!(),
+        }
+    }
+
+    /// Collapses maximal runs of identical adjacent symbols in `seq` into `Run` rules, in place.
+    #[inline]
+    fn collapse_runs_in_place(&mut self, seq: &mut Vec<SymbolId>) {
+        let n = seq.len();
+        let mut write = 0usize;
+        let mut read = 0usize;
+        while read < n {
+            let sym = seq[read];
+            let mut q = read + 1;
+            while q < n && seq[q] == sym {
+                q += 1;
+            }
+            seq[write] = if q - read == 1 {
+                sym
+            } else {
+                self.lcp_run(sym, (q - read) as u64)
+            };
+            write += 1;
+            read = q;
+        }
+        seq.truncate(write);
+    }
+
+    /// Reduces a non-empty symbol sequence to a single root symbol by alternating
+    /// local-minimum block contraction (Phase B) and run-length contraction (Phase A).
+    /// `next_seq` is scratch space; both buffers are clobbered.
+    fn reduce_levels(&mut self, seq: &mut Vec<SymbolId>, next_seq: &mut Vec<SymbolId>) -> SymbolId {
+        debug_assert!(!seq.is_empty());
+        while seq.len() > 1 {
+            let n = seq.len();
+            if n == 2 {
+                return self.lcp_pair(seq[0], seq[1]);
+            }
+            if n == 3 {
+                let left = self.lcp_pair(seq[0], seq[1]);
+                return self.lcp_pair(left, seq[2]);
+            }
+
+            next_seq.clear();
+            let mut span_start = 0usize;
+            let mut prev_hash = self.lcp_landmark(seq[0]);
+            let mut cur_hash = self.lcp_landmark(seq[1]);
+            for idx in 1..(n - 1) {
+                let next_hash = self.lcp_landmark(seq[idx + 1]);
+                if cur_hash < prev_hash && cur_hash < next_hash {
+                    self.contract_span(&seq[span_start..idx], next_seq);
+                    span_start = idx;
+                }
+                prev_hash = cur_hash;
+                cur_hash = next_hash;
+            }
+            self.contract_span(&seq[span_start..n], next_seq);
+
+            self.collapse_runs_in_place(next_seq);
+            std::mem::swap(seq, next_seq);
+        }
+        seq[0]
     }
 }
 
+/// Resolves the `(child, count)` of a new `Run` rule: flattens `Run(Run(base, k), count)` into
+/// `Run(base, k * count)` unless that would exceed the on-disk `u32` run-count limit, in which
+/// case `child` is kept as a (nested) run.
 #[inline(always)]
-const fn terminal_shash(b: u8) -> u64 {
-    if b == b'\n' {
-        0
-    } else {
-        splitmix64_non_zero(b as u64)
+fn flatten_run(child: SymbolId, count: u64, base: SymbolId, base_count: u64) -> (SymbolId, u64) {
+    match base_count.checked_mul(count) {
+        Some(total) if total <= MAX_RUN_COUNT => (base, total),
+        _ => (child, count),
     }
 }
 
@@ -71,15 +180,6 @@ impl<'s> LocalChunkCompressor<'s> {
     }
 
     #[inline(always)]
-    fn landmark_hash(&self, sym: SymbolId) -> u64 {
-        if let Some(b) = sym.as_byte() {
-            terminal_shash(b)
-        } else {
-            splitmix64_non_zero(sym.0 as u64)
-        }
-    }
-
-    #[inline(always)]
     fn sym_meta(&self, sym: SymbolId) -> (u64, u16, u8, u8) {
         if let Some(b) = sym.as_byte() {
             (1, 0, b, b)
@@ -118,7 +218,10 @@ impl<'s> LocalChunkCompressor<'s> {
             return child;
         }
         let (base_child, base_count) = self.as_run(child);
-        let total_count = base_count * count;
+        let (base_child, total_count) = flatten_run(child, count, base_child, base_count);
+        if total_count > MAX_RUN_COUNT {
+            return self.intern_oversized_run(base_child, total_count);
+        }
         if base_child.0 < self.seed_watermark {
             if let Some(si) = self.seed_interner {
                 if let Some(existing) = si.get_run(base_child, total_count) {
@@ -152,13 +255,13 @@ impl<'s> LocalChunkCompressor<'s> {
     fn intern_pair(&mut self, left: SymbolId, right: SymbolId) -> SymbolId {
         let (l_base, l_count) = self.as_run(left);
         let (r_base, r_count) = self.as_run(right);
-        if l_base == r_base {
+        if l_base == r_base && l_count + r_count <= MAX_RUN_COUNT {
             return self.intern_run(l_base, l_count + r_count);
         }
         let (l_len, l_height, first_byte, _) = self.sym_meta(left);
         let (r_len, r_height, _, last_byte) = self.sym_meta(right);
         let byte_len = l_len + r_len;
-        if (byte_len <= 16 || (byte_len <= 28 && last_byte != b'\n'))
+        if is_globally_interned_pair(byte_len, last_byte)
             && left.0 < self.seed_watermark
             && right.0 < self.seed_watermark
         {
@@ -168,7 +271,7 @@ impl<'s> LocalChunkCompressor<'s> {
                 }
             }
         }
-        let key = ((left.0 as u64) << 32) | (right.0 as u64);
+        let key = RuleInterner::pack_pair_key(left, right);
         if let Some(&existing) = self.pair_map.get(&key) {
             return existing;
         }
@@ -184,34 +287,6 @@ impl<'s> LocalChunkCompressor<'s> {
         });
         self.pair_map.insert(key, sym);
         sym
-    }
-
-    #[inline]
-    fn contract_span(&mut self, span: &[SymbolId], out: &mut Vec<SymbolId>) {
-        let mut p = 0;
-        let len = span.len();
-        if len == 1 {
-            out.push(span[0]);
-            return;
-        }
-        while len - p > 3 {
-            let pair = self.intern_pair(span[p], span[p + 1]);
-            out.push(pair);
-            p += 2;
-        }
-        match len - p {
-            2 => {
-                let pair = self.intern_pair(span[p], span[p + 1]);
-                out.push(pair);
-            }
-            3 => {
-                let left = self.intern_pair(span[p], span[p + 1]);
-                let triple = self.intern_pair(left, span[p + 2]);
-                out.push(triple);
-            }
-            0 => {}
-            _ => unreachable!(),
-        }
     }
 
     #[inline]
@@ -398,57 +473,6 @@ impl<'s> LocalChunkCompressor<'s> {
         has_non_ascii
     }
 
-    /// Reduces a non-empty symbol sequence in-place to a single root `SymbolId` using LCP recompression.
-    #[inline]
-    fn reduce_sequence(&mut self, seq: &mut Vec<SymbolId>, next_seq: &mut Vec<SymbolId>) -> SymbolId {
-        debug_assert!(!seq.is_empty());
-        while seq.len() > 1 {
-            let n = seq.len();
-            if n == 2 {
-                return self.intern_pair(seq[0], seq[1]);
-            }
-            if n == 3 {
-                let left = self.intern_pair(seq[0], seq[1]);
-                return self.intern_pair(left, seq[2]);
-            }
-
-            next_seq.clear();
-            let mut span_start = 0usize;
-            let mut prev_hash = self.landmark_hash(seq[0]);
-            let mut cur_hash = self.landmark_hash(seq[1]);
-
-            for idx in 1..(n - 1) {
-                let next_hash = self.landmark_hash(seq[idx + 1]);
-                if cur_hash < prev_hash && cur_hash < next_hash {
-                    self.contract_span(&seq[span_start..idx], next_seq);
-                    span_start = idx;
-                }
-                prev_hash = cur_hash;
-                cur_hash = next_hash;
-            }
-            self.contract_span(&seq[span_start..n], next_seq);
-
-            seq.clear();
-            let m = next_seq.len();
-            let mut p = 0;
-            while p < m {
-                let sym = next_seq[p];
-                let mut q = p + 1;
-                while q < m && next_seq[q] == sym {
-                    q += 1;
-                }
-                let run_len = (q - p) as u64;
-                if run_len == 1 {
-                    seq.push(sym);
-                } else {
-                    seq.push(self.intern_run(sym, run_len));
-                }
-                p = q;
-            }
-        }
-        seq[0]
-    }
-
     #[inline]
     fn compress_line_body<'a>(
         &mut self,
@@ -469,7 +493,7 @@ impl<'s> LocalChunkCompressor<'s> {
         let sym = if !has_non_ascii && body.len() <= 1024 {
             self.fold_sym_slice(seq)
         } else {
-            self.reduce_sequence(seq, next_seq)
+            self.reduce_levels(seq, next_seq)
         };
         if body.len() <= 512 {
             seg_cache.insert(body, sym);
@@ -632,15 +656,6 @@ impl<'a> LocalDocTreeCompressor<'a> {
     }
 
     #[inline(always)]
-    fn content_landmark_hash(&self, sym: SymbolId) -> u64 {
-        if let Some(b) = sym.as_byte() {
-            terminal_shash(b)
-        } else {
-            splitmix64_non_zero(sym.0 as u64)
-        }
-    }
-
-    #[inline(always)]
     fn as_run(&self, sym: SymbolId) -> (SymbolId, u64) {
         if !sym.is_terminal() {
             if let RuleKind::Run { child, count } = self.rule_ref(sym).kind {
@@ -656,7 +671,10 @@ impl<'a> LocalDocTreeCompressor<'a> {
             return child;
         }
         let (base_child, base_count) = self.as_run(child);
-        let total_count = base_count * count;
+        let (base_child, total_count) = flatten_run(child, count, base_child, base_count);
+        if total_count > MAX_RUN_COUNT {
+            return self.intern_oversized_run(base_child, total_count);
+        }
         if let Some(&existing) = self.run_map.get(&(base_child, total_count)) {
             return existing;
         }
@@ -680,13 +698,13 @@ impl<'a> LocalDocTreeCompressor<'a> {
 
     #[inline]
     fn intern_pair(&mut self, left: SymbolId, right: SymbolId) -> SymbolId {
-        let key = ((left.0 as u64) << 32) | (right.0 as u64);
+        let key = RuleInterner::pack_pair_key(left, right);
         if let Some(&existing) = self.pair_map.get(&key) {
             return existing;
         }
         let (l_base, l_count) = self.as_run(left);
         let (r_base, r_count) = self.as_run(right);
-        if l_base == r_base {
+        if l_base == r_base && l_count + r_count <= MAX_RUN_COUNT {
             return self.intern_run(l_base, l_count + r_count);
         }
         let (l_len, l_height, first_byte, _) = self.sym_meta(left);
@@ -705,110 +723,49 @@ impl<'a> LocalDocTreeCompressor<'a> {
         sym
     }
 
-    #[inline]
-    fn contract_span(&mut self, span: &[SymbolId], out: &mut Vec<SymbolId>) {
-        let mut p = 0;
-        let len = span.len();
-        if len == 1 {
-            out.push(span[0]);
-            return;
-        }
-        while len - p > 3 {
-            let pair = self.intern_pair(span[p], span[p + 1]);
-            out.push(pair);
-            p += 2;
-        }
-        match len - p {
-            2 => {
-                let pair = self.intern_pair(span[p], span[p + 1]);
-                out.push(pair);
-            }
-            3 => {
-                let left = self.intern_pair(span[p], span[p + 1]);
-                let triple = self.intern_pair(left, span[p + 2]);
-                out.push(triple);
-            }
-            0 => {}
-            _ => unreachable!(),
-        }
-    }
-
     fn compress_doc_sequence(
         &mut self,
         seq: &mut Vec<SymbolId>,
         next_seq: &mut Vec<SymbolId>,
     ) -> Option<SymbolId> {
-        if seq.is_empty() {
-            return None;
-        }
-        if seq.len() == 1 {
-            return Some(seq[0]);
-        }
-
-        // Collapse initial runs
-        let mut write = 0usize;
-        let mut read = 0usize;
-        while read < seq.len() {
-            let s = seq[read];
-            let mut q = read + 1;
-            while q < seq.len() && seq[q] == s {
-                q += 1;
-            }
-            seq[write] = if q - read == 1 {
-                s
-            } else {
-                self.intern_run(s, (q - read) as u64)
-            };
-            write += 1;
-            read = q;
-        }
-        seq.truncate(write);
-
-        while seq.len() > 1 {
-            let n = seq.len();
-            if n == 2 {
-                return Some(self.intern_pair(seq[0], seq[1]));
-            }
-            if n == 3 {
-                let left = self.intern_pair(seq[0], seq[1]);
-                return Some(self.intern_pair(left, seq[2]));
-            }
-
-            next_seq.clear();
-            let mut span_start = 0usize;
-            let mut prev_hash = self.content_landmark_hash(seq[0]);
-            let mut cur_hash = self.content_landmark_hash(seq[1]);
-
-            for idx in 1..(n - 1) {
-                let next_hash = self.content_landmark_hash(seq[idx + 1]);
-                if cur_hash < prev_hash && cur_hash < next_hash {
-                    self.contract_span(&seq[span_start..idx], next_seq);
-                    span_start = idx;
-                }
-                prev_hash = cur_hash;
-                cur_hash = next_hash;
-            }
-            self.contract_span(&seq[span_start..n], next_seq);
-
-            seq.clear();
-            let m = next_seq.len();
-            let mut p = 0;
-            while p < m {
-                let sym = next_seq[p];
-                let mut q = p + 1;
-                while q < m && next_seq[q] == sym {
-                    q += 1;
-                }
-                let run_len = (q - p) as u64;
-                if run_len == 1 {
-                    seq.push(sym);
-                } else {
-                    seq.push(self.intern_run(sym, run_len));
-                }
-                p = q;
+        match seq.len() {
+            0 => None,
+            1 => Some(seq[0]),
+            _ => {
+                self.collapse_runs_in_place(seq);
+                Some(self.reduce_levels(seq, next_seq))
             }
         }
-        Some(seq[0])
+    }
+}
+
+impl LcpBuilder for LocalDocTreeCompressor<'_> {
+    #[inline(always)]
+    fn lcp_pair(&mut self, left: SymbolId, right: SymbolId) -> SymbolId {
+        self.intern_pair(left, right)
+    }
+    #[inline(always)]
+    fn lcp_run(&mut self, child: SymbolId, count: u64) -> SymbolId {
+        self.intern_run(child, count)
+    }
+    #[inline(always)]
+    fn lcp_landmark(&self, sym: SymbolId) -> u64 {
+        landmark_hash(sym)
+    }
+}
+
+impl LcpBuilder for LocalChunkCompressor<'_> {
+    #[inline(always)]
+    fn lcp_pair(&mut self, left: SymbolId, right: SymbolId) -> SymbolId {
+        self.intern_pair(left, right)
+    }
+    #[inline(always)]
+    fn lcp_run(&mut self, child: SymbolId, count: u64) -> SymbolId {
+        self.intern_run(child, count)
+    }
+    #[inline(always)]
+    fn lcp_landmark(&self, sym: SymbolId) -> u64 {
+        landmark_hash(sym)
     }
 }
 
@@ -1511,22 +1468,21 @@ impl GrammarDag {
                 kr_hash: doc_kr_hash,
             };
             if check_existing {
-                if let Some(existing) = self.roots.iter_mut().find(|r| r.name == *name) {
-                    *existing = entry.clone();
-                    entries.push(entry);
-                    continue;
-                }
+                self.upsert_root(entry.clone());
+            } else {
+                self.roots.push(entry.clone());
             }
-            self.roots.push(entry.clone());
             entries.push(entry);
         }
         entries
     }
 
+    /// Content-derived landmark priority for document-level symbols (independent of the
+    /// order in which rules were allocated).
     #[inline(always)]
     fn content_landmark_hash(&self, sym: SymbolId) -> u64 {
-        if let Some(b) = sym.as_byte() {
-            terminal_shash(b)
+        if sym.is_terminal() {
+            landmark_hash(sym)
         } else {
             let n = &self.rules[sym.rule_index()];
             let tag = match n.kind {
@@ -1551,123 +1507,16 @@ impl GrammarDag {
     /// Runs iterative Recompression (Phase B local-minimum block contraction followed by
     /// Phase A run-length contraction) on an initial sequence of symbols.
     pub(crate) fn compress_symbol_sequence(&mut self, mut seq: Vec<SymbolId>) -> Option<SymbolId> {
-        if seq.is_empty() {
-            return None;
-        }
-        if seq.len() == 1 {
-            return Some(seq[0]);
-        }
-
-        seq = self.contract_runs(seq);
-
-        let mut next_seq = Vec::with_capacity((seq.len() * 2) / 3 + 4);
-        while seq.len() > 1 {
-            next_seq.clear();
-            let n = seq.len();
-
-            if n == 2 {
-                let root = self.intern_pair(seq[0], seq[1]);
-                return Some(root);
-            }
-            if n == 3 {
-                let left = self.intern_pair(seq[0], seq[1]);
-                let root = self.intern_pair(left, seq[2]);
-                return Some(root);
-            }
-
-            let mut span_start = 0usize;
-            let mut prev_hash = self.content_landmark_hash(seq[0]);
-            let mut cur_hash = self.content_landmark_hash(seq[1]);
-
-            for idx in 1..(n - 1) {
-                let next_hash = self.content_landmark_hash(seq[idx + 1]);
-                if cur_hash < prev_hash && cur_hash < next_hash {
-                    self.contract_span(&seq[span_start..idx], &mut next_seq);
-                    span_start = idx;
+        match seq.len() {
+            0 => None,
+            1 => Some(seq[0]),
+            n => {
+                if seq.windows(2).any(|w| w[0] == w[1]) {
+                    self.collapse_runs_in_place(&mut seq);
                 }
-                prev_hash = cur_hash;
-                cur_hash = next_hash;
+                let mut next_seq = Vec::with_capacity((n * 2) / 3 + 4);
+                Some(self.reduce_levels(&mut seq, &mut next_seq))
             }
-            self.contract_span(&seq[span_start..n], &mut next_seq);
-
-            seq.clear();
-            let m = next_seq.len();
-            let mut p = 0;
-            while p < m {
-                let sym = next_seq[p];
-                let mut q = p + 1;
-                while q < m && next_seq[q] == sym {
-                    q += 1;
-                }
-                let run_len = (q - p) as u64;
-                if run_len == 1 {
-                    seq.push(sym);
-                } else {
-                    seq.push(self.intern_run(sym, run_len));
-                }
-                p = q;
-            }
-        }
-
-        Some(seq[0])
-    }
-
-    #[inline]
-    fn contract_runs(&mut self, seq: Vec<SymbolId>) -> Vec<SymbolId> {
-        let mut has_adjacent_dup = false;
-        for w in seq.windows(2) {
-            if w[0] == w[1] {
-                has_adjacent_dup = true;
-                break;
-            }
-        }
-        if !has_adjacent_dup {
-            return seq;
-        }
-        let mut out = Vec::with_capacity(seq.len());
-        let mut i = 0;
-        while i < seq.len() {
-            let sym = seq[i];
-            let mut j = i + 1;
-            while j < seq.len() && seq[j] == sym {
-                j += 1;
-            }
-            let count = (j - i) as u64;
-            if count == 1 {
-                out.push(sym);
-            } else {
-                out.push(self.intern_run(sym, count));
-            }
-            i = j;
-        }
-        out
-    }
-
-    #[inline]
-    fn contract_span(&mut self, span: &[SymbolId], out: &mut Vec<SymbolId>) {
-        let mut p = 0;
-        let len = span.len();
-        if len == 1 {
-            out.push(span[0]);
-            return;
-        }
-        while len - p > 3 {
-            let pair = self.intern_pair(span[p], span[p + 1]);
-            out.push(pair);
-            p += 2;
-        }
-        match len - p {
-            2 => {
-                let pair = self.intern_pair(span[p], span[p + 1]);
-                out.push(pair);
-            }
-            3 => {
-                let left = self.intern_pair(span[p], span[p + 1]);
-                let triple = self.intern_pair(left, span[p + 2]);
-                out.push(triple);
-            }
-            0 => {}
-            _ => unreachable!(),
         }
     }
 
@@ -1680,16 +1529,12 @@ impl GrammarDag {
             None => (0, 0),
         };
         let entry = RootEntry {
-            name: name.clone(),
+            name,
             root_symbol,
             byte_len,
             kr_hash,
         };
-        if let Some(existing) = self.roots.iter_mut().find(|r| r.name == name) {
-            *existing = entry.clone();
-        } else {
-            self.roots.push(entry.clone());
-        }
+        self.upsert_root(entry.clone());
         entry
     }
 
@@ -1721,17 +1566,7 @@ impl GrammarDag {
             RuleKind::Run { child, count } => {
                 let start = out.len();
                 self.expand_recursive(child, out);
-                let child_len = out.len() - start;
-                if child_len == 0 {
-                    return;
-                }
-                let mut copied = 1u64;
-                while copied < count {
-                    let to_copy = copied.min(count - copied);
-                    let copy_bytes = (to_copy as usize) * child_len;
-                    out.extend_from_within(start..start + copy_bytes);
-                    copied += to_copy;
-                }
+                repeat_tail(out, start, count);
             }
         }
     }
@@ -1744,6 +1579,21 @@ impl GrammarDag {
             self.decompress_symbol_into(sym, &mut out);
         }
         Ok(out)
+    }
+}
+
+impl LcpBuilder for GrammarDag {
+    #[inline(always)]
+    fn lcp_pair(&mut self, left: SymbolId, right: SymbolId) -> SymbolId {
+        self.intern_pair(left, right)
+    }
+    #[inline(always)]
+    fn lcp_run(&mut self, child: SymbolId, count: u64) -> SymbolId {
+        self.intern_run(child, count)
+    }
+    #[inline(always)]
+    fn lcp_landmark(&self, sym: SymbolId) -> u64 {
+        self.content_landmark_hash(sym)
     }
 }
 

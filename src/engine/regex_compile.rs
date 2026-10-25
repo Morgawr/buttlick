@@ -6,7 +6,8 @@ use rustc_hash::FxHashMap;
 
 use crate::engine::transducer::MealyTransducer;
 use crate::error::{ButtlickError, Result};
-use crate::format::header::PackedRuleNode;
+use crate::format::header::{PackedRuleNode, PACKED_RULE_SIZE};
+use crate::format::mapped::MappedMeta;
 use crate::format::MappedArchive;
 use crate::grammar::{GrammarDag, SymbolId};
 
@@ -17,6 +18,18 @@ pub enum GrepMode {
     LineCount,
     /// Counts total non-overlapping matches of the regular expression across the stream.
     MatchCount,
+}
+
+/// Transducer states are stored as `u16`; reject patterns whose DFA exceeds that
+/// (state ids would otherwise silently wrap around during construction).
+fn check_state_count(pattern: &str, num_states: usize) -> Result<()> {
+    if num_states > u16::MAX as usize + 1 {
+        return Err(ButtlickError::InvalidRegex {
+            pattern: pattern.to_string(),
+            message: format!("pattern compiles to too many DFA states ({num_states})"),
+        });
+    }
+    Ok(())
 }
 
 /// Compiles a regular expression into a `MealyTransducer` for `GrepMode::LineCount` (`grep -E -c`).
@@ -101,6 +114,7 @@ pub fn compile_line_grep_transducer(pattern: &str) -> Result<MealyTransducer> {
     }
 
     let num_states = 2 + trans_to_dfa.len();
+    check_state_count(pattern, num_states)?;
     let mut byte_next = vec![0u16; num_states * 256];
     let mut byte_emit = vec![0u64; num_states * 256];
     let mut eof_emit = vec![0u64; num_states];
@@ -240,6 +254,7 @@ pub fn compile_match_count_transducer(pattern: &str) -> Result<MealyTransducer> 
     }
 
     let num_states = trans_to_dfa.len();
+    check_state_count(pattern, num_states)?;
     let mut byte_next = vec![0u16; num_states * 256];
     let mut byte_emit = vec![0u64; num_states * 256];
     let mut eof_emit = vec![0u64; num_states];
@@ -372,94 +387,478 @@ impl GrammarDag {
     }
 }
 
-#[inline]
-fn eval_sym_state(
-    sym: SymbolId,
-    q: u16,
-    rules_bytes: &[u8],
-    terminal_packed: &[u8],
-    table: &[u8],
-    memo: &mut FxHashMap<u64, u8>,
-) -> u8 {
-    if q == 0 {
-        return unsafe { *table.get_unchecked(sym.0 as usize) };
+/// A packed `(transducer state, emitted)` cell used by the zero-copy mmap evaluators.
+///
+/// The most significant bit carries the "emitted at least once" flag and the remaining bits hold
+/// the exit state, so the per-symbol table costs 1 byte (`u8`, up to 128 states) or 2 bytes
+/// (`u16`, up to 32768 states) per symbol.
+trait PackedCell:
+    Copy + std::ops::BitOr<Output = Self> + std::ops::BitAnd<Output = Self> + Eq + 'static
+{
+    const ZERO: Self;
+    const EMIT_FLAG: Self;
+    const MAX_STATES: usize;
+    fn from_state(q: u16) -> Self;
+    fn state(self) -> u16;
+    #[inline(always)]
+    fn emitted(self) -> bool {
+        (self & Self::EMIT_FLAG) != Self::ZERO
     }
-    if let Some(b) = sym.as_byte() {
-        return terminal_packed[(q as usize) * 256 + (b as usize)];
+    #[inline(always)]
+    fn emit_bit(self) -> Self {
+        self & Self::EMIT_FLAG
     }
-    let key = ((sym.0 as u64) << 16) | (q as u64);
-    if let Some(&cached) = memo.get(&key) {
-        return cached;
+}
+
+impl PackedCell for u8 {
+    const ZERO: Self = 0;
+    const EMIT_FLAG: Self = 0x80;
+    const MAX_STATES: usize = 0x80;
+    #[inline(always)]
+    fn from_state(q: u16) -> Self {
+        q as u8
     }
-    let off = sym.rule_index() * 8;
-    let w0 = u32::from_le_bytes([
-        rules_bytes[off],
-        rules_bytes[off + 1],
-        rules_bytes[off + 2],
-        rules_bytes[off + 3],
-    ]);
-    let w1 = u32::from_le_bytes([
-        rules_bytes[off + 4],
-        rules_bytes[off + 5],
-        rules_bytes[off + 6],
-        rules_bytes[off + 7],
-    ]);
-    let res = if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
-        let l_val = eval_sym_state(SymbolId(w0), q, rules_bytes, terminal_packed, table, memo);
-        let q_mid = (l_val & 0x7F) as u16;
-        let r_val = if q_mid == 0 {
-            unsafe { *table.get_unchecked(w1 as usize) }
-        } else {
-            eval_sym_state(
-                SymbolId(w1),
-                q_mid,
-                rules_bytes,
-                terminal_packed,
-                table,
-                memo,
-            )
-        };
-        r_val | (l_val & 0x80)
+    #[inline(always)]
+    fn state(self) -> u16 {
+        (self & 0x7F) as u16
+    }
+}
+
+impl PackedCell for u16 {
+    const ZERO: Self = 0;
+    const EMIT_FLAG: Self = 0x8000;
+    const MAX_STATES: usize = 0x8000;
+    #[inline(always)]
+    fn from_state(q: u16) -> Self {
+        q
+    }
+    #[inline(always)]
+    fn state(self) -> u16 {
+        self & 0x7FFF
+    }
+}
+
+#[cold]
+fn topological_violation(rule_idx: usize) -> ButtlickError {
+    ButtlickError::CorruptedFormat(format!("Topological ordering violation at rule {rule_idx}"))
+}
+
+/// Rejects rules that reference symbols at or above their own id (only possible in a corrupted
+/// archive). This guarantees that every child lookup in the evaluators is in-bounds and refers to
+/// an already-evaluated symbol.
+#[inline(always)]
+fn check_topological(rule_idx: usize, packed: PackedRuleNode) -> Result<()> {
+    let sym_id = SymbolId::from_rule_index(rule_idx).0;
+    let ok = if packed.is_run() {
+        packed.first_sym().0 < sym_id
     } else {
-        let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
-        eval_run_state(
-            child,
-            w1 as u64,
-            q,
-            rules_bytes,
+        packed.word0 < sym_id && packed.word1 < sym_id
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(topological_violation(rule_idx))
+    }
+}
+
+/// Zero-copy evaluator of a `MealyTransducer` over the on-disk packed rule table.
+struct PackedEval<'a, C: PackedCell> {
+    rules_bytes: &'a [u8],
+    /// `[q * 256 + b]` -> packed exit cell for terminal byte `b` entered in state `q`.
+    terminal_packed: Vec<C>,
+    /// `[sym]` -> packed exit cell for symbol `sym` entered in state 0.
+    table: Vec<C>,
+}
+
+impl<'a, C: PackedCell> PackedEval<'a, C> {
+    fn new(archive: &'a MappedArchive, transducer: &MealyTransducer) -> Self {
+        debug_assert!(transducer.num_states <= C::MAX_STATES);
+        let terminal_packed: Vec<C> = transducer
+            .byte_next
+            .iter()
+            .zip(&transducer.byte_emit)
+            .map(|(&nq, &em)| {
+                let cell = C::from_state(nq);
+                if em > 0 {
+                    cell | C::EMIT_FLAG
+                } else {
+                    cell
+                }
+            })
+            .collect();
+        let mut table = vec![C::ZERO; 256 + archive.num_rules];
+        table[0..256].copy_from_slice(&terminal_packed[0..256]);
+        Self {
+            rules_bytes: archive.rules_bytes(),
             terminal_packed,
             table,
-            memo,
-        )
-    };
-    memo.insert(key, res);
-    res
-}
-
-#[inline]
-fn eval_run_state(
-    child: SymbolId,
-    count: u64,
-    q: u16,
-    rules_bytes: &[u8],
-    terminal_packed: &[u8],
-    table: &[u8],
-    memo: &mut FxHashMap<u64, u8>,
-) -> u8 {
-    let mut cur_q = q;
-    let mut emitted = 0u8;
-    for _ in 0..count {
-        let v = eval_sym_state(child, cur_q, rules_bytes, terminal_packed, table, memo);
-        let next_q = (v & 0x7F) as u16;
-        emitted |= v & 0x80;
-        if next_q == cur_q {
-            break;
         }
-        cur_q = next_q;
     }
-    (cur_q as u8) | emitted
+
+    #[inline(always)]
+    fn rule(&self, sym: SymbolId) -> PackedRuleNode {
+        PackedRuleNode::read_at(self.rules_bytes, sym.rule_index())
+    }
+
+    /// Packed exit cell of `sym` entered in state 0.
+    #[inline(always)]
+    fn table_at(&self, sym: SymbolId) -> C {
+        // SAFETY: `sym` is either a terminal (< 256) or a rule validated by `check_topological`
+        // (or a root validated on open), so `sym.0 < 256 + num_rules == table.len()`.
+        unsafe { *self.table.get_unchecked(sym.0 as usize) }
+    }
+
+    #[inline(always)]
+    fn set_table(&mut self, rule_idx: usize, cell: C) {
+        self.table[256 + rule_idx] = cell;
+    }
+
+    /// Builds `table` for the state-only evaluation used by line extraction.
+    fn build_line_table(&mut self, memo: &mut FxHashMap<u64, C>) -> Result<()> {
+        let rules_bytes = self.rules_bytes;
+        for (idx, chunk) in rules_bytes.chunks_exact(PACKED_RULE_SIZE).enumerate() {
+            let packed = PackedRuleNode::from_bytes(chunk.try_into().unwrap());
+            check_topological(idx, packed)?;
+            let cell = if !packed.is_run() {
+                let l_val = self.table_at(SymbolId(packed.word0));
+                if l_val.state() == 0 {
+                    self.table_at(SymbolId(packed.word1)) | l_val
+                } else {
+                    let r_val = self.eval_sym_state(SymbolId(packed.word1), l_val.state(), memo);
+                    r_val | l_val.emit_bit()
+                }
+            } else {
+                self.eval_run_state(packed.first_sym(), packed.word1 as u64, 0, memo)
+            };
+            self.set_table(idx, cell);
+        }
+        Ok(())
+    }
+
+    fn eval_sym_state(&self, sym: SymbolId, q: u16, memo: &mut FxHashMap<u64, C>) -> C {
+        if q == 0 {
+            return self.table_at(sym);
+        }
+        if let Some(b) = sym.as_byte() {
+            return self.terminal_packed[(q as usize) * 256 + (b as usize)];
+        }
+        let key = ((sym.0 as u64) << 16) | (q as u64);
+        if let Some(&cached) = memo.get(&key) {
+            return cached;
+        }
+        let packed = self.rule(sym);
+        let res = if !packed.is_run() {
+            let l_val = self.eval_sym_state(SymbolId(packed.word0), q, memo);
+            let r_val = self.eval_sym_state(SymbolId(packed.word1), l_val.state(), memo);
+            r_val | l_val.emit_bit()
+        } else {
+            self.eval_run_state(packed.first_sym(), packed.word1 as u64, q, memo)
+        };
+        memo.insert(key, res);
+        res
+    }
+
+    fn eval_run_state(
+        &self,
+        child: SymbolId,
+        count: u64,
+        q: u16,
+        memo: &mut FxHashMap<u64, C>,
+    ) -> C {
+        let mut cur_q = q;
+        let mut emitted = C::ZERO;
+        for _ in 0..count {
+            let v = self.eval_sym_state(child, cur_q, memo);
+            let next_q = v.state();
+            emitted = emitted | v.emit_bit();
+            if next_q == cur_q {
+                break;
+            }
+            cur_q = next_q;
+        }
+        C::from_state(cur_q) | emitted
+    }
+
+    /// Number of emissions while consuming `sym` from state 0, given its packed cell `v`.
+    #[inline(always)]
+    fn emit0_count(sym: SymbolId, v: C, emit0_counts: &FxHashMap<u32, u64>) -> u64 {
+        if !v.emitted() {
+            0
+        } else if sym.is_terminal() {
+            1
+        } else {
+            emit0_counts[&sym.0]
+        }
+    }
+
+    /// Builds `table` plus the exact emission counts (from state 0) of every emitting symbol.
+    fn build_count_table(&mut self) -> Result<FxHashMap<u32, u64>> {
+        let rules_bytes = self.rules_bytes;
+        let mut emit0_counts: FxHashMap<u32, u64> = FxHashMap::default();
+        let mut memo: FxHashMap<u64, (C, u64)> = FxHashMap::default();
+
+        for (idx, chunk) in rules_bytes.chunks_exact(PACKED_RULE_SIZE).enumerate() {
+            let packed = PackedRuleNode::from_bytes(chunk.try_into().unwrap());
+            check_topological(idx, packed)?;
+            let (cell, count) = if !packed.is_run() {
+                let (left, right) = (SymbolId(packed.word0), SymbolId(packed.word1));
+                let l_val = self.table_at(left);
+                let lc = Self::emit0_count(left, l_val, &emit0_counts);
+                if l_val.state() == 0 {
+                    let r_val = self.table_at(right);
+                    (r_val | l_val, lc + Self::emit0_count(right, r_val, &emit0_counts))
+                } else {
+                    let (r_val, rc) =
+                        self.eval_sym_count_state(right, l_val.state(), &emit0_counts, &mut memo);
+                    (r_val | l_val.emit_bit(), lc + rc)
+                }
+            } else {
+                self.eval_run_count_state(
+                    packed.first_sym(),
+                    packed.word1 as u64,
+                    0,
+                    &emit0_counts,
+                    &mut memo,
+                )
+            };
+            self.set_table(idx, cell);
+            if cell.emitted() {
+                emit0_counts.insert(SymbolId::from_rule_index(idx).0, count);
+            }
+        }
+        Ok(emit0_counts)
+    }
+
+    fn eval_sym_count_state(
+        &self,
+        sym: SymbolId,
+        q: u16,
+        emit0_counts: &FxHashMap<u32, u64>,
+        memo: &mut FxHashMap<u64, (C, u64)>,
+    ) -> (C, u64) {
+        if q == 0 {
+            let v = self.table_at(sym);
+            return (v, Self::emit0_count(sym, v, emit0_counts));
+        }
+        if let Some(b) = sym.as_byte() {
+            let v = self.terminal_packed[(q as usize) * 256 + (b as usize)];
+            return (v, v.emitted() as u64);
+        }
+        let key = ((sym.0 as u64) << 16) | (q as u64);
+        if let Some(&cached) = memo.get(&key) {
+            return cached;
+        }
+        let packed = self.rule(sym);
+        let res = if !packed.is_run() {
+            let (l_val, lc) =
+                self.eval_sym_count_state(SymbolId(packed.word0), q, emit0_counts, memo);
+            let (r_val, rc) =
+                self.eval_sym_count_state(SymbolId(packed.word1), l_val.state(), emit0_counts, memo);
+            (r_val | l_val.emit_bit(), lc + rc)
+        } else {
+            self.eval_run_count_state(packed.first_sym(), packed.word1 as u64, q, emit0_counts, memo)
+        };
+        memo.insert(key, res);
+        res
+    }
+
+    fn eval_run_count_state(
+        &self,
+        child: SymbolId,
+        count: u64,
+        q: u16,
+        emit0_counts: &FxHashMap<u32, u64>,
+        memo: &mut FxHashMap<u64, (C, u64)>,
+    ) -> (C, u64) {
+        let mut cur_q = q;
+        let mut emitted = C::ZERO;
+        let mut total_c = 0u64;
+        for i in 0..count {
+            let (v, c) = self.eval_sym_count_state(child, cur_q, emit0_counts, memo);
+            let next_q = v.state();
+            if next_q == cur_q {
+                // Fixed point: every remaining repetition behaves identically.
+                if c > 0 {
+                    emitted = C::EMIT_FLAG;
+                    total_c += (count - i) * c;
+                }
+                break;
+            }
+            emitted = emitted | v.emit_bit();
+            total_c += c;
+            cur_q = next_q;
+        }
+        (C::from_state(cur_q) | emitted, total_c)
+    }
+
+    /// Total emissions (stream + end-of-file) for a document root, after `build_count_table`.
+    #[inline]
+    fn root_count(
+        &self,
+        transducer: &MealyTransducer,
+        sym: SymbolId,
+        emit0_counts: &FxHashMap<u32, u64>,
+    ) -> u64 {
+        let root_val = self.table_at(sym);
+        Self::emit0_count(sym, root_val, emit0_counts)
+            + transducer.eof_emit[root_val.state() as usize]
+    }
+
+    /// Appends the document offsets of up to `walk.limit` emitting bytes inside `sym` (entered in
+    /// state `q` at document offset `base`), in increasing order, after `build_count_table`.
+    /// Returns the exit state.
+    fn walk_emitted_offsets(
+        &self,
+        walk: &mut OffsetWalk<'_, C>,
+        sym: SymbolId,
+        q: u16,
+        base: u64,
+    ) -> Result<u16> {
+        let (v, _) = self.eval_sym_count_state(sym, q, walk.emit0_counts, &mut walk.memo);
+        if !v.emitted() || walk.out.len() >= walk.limit {
+            return Ok(v.state());
+        }
+        if sym.is_terminal() {
+            walk.out.push(base);
+            return Ok(v.state());
+        }
+        let packed = self.rule(sym);
+        if !packed.is_run() {
+            let (left, right) = (SymbolId(packed.word0), SymbolId(packed.word1));
+            let q_mid = self.walk_emitted_offsets(walk, left, q, base)?;
+            if walk.out.len() < walk.limit {
+                let l_len = walk.archive.sym_len(left, &mut walk.meta)?;
+                self.walk_emitted_offsets(walk, right, q_mid, base + l_len)?;
+            }
+        } else {
+            let child = packed.first_sym();
+            let c_len = walk.archive.sym_len(child, &mut walk.meta)?;
+            let mut cur_q = q;
+            let mut cur_base = base;
+            for _ in 0..packed.word1 {
+                if walk.out.len() >= walk.limit {
+                    break;
+                }
+                let (cv, _) = self.eval_sym_count_state(child, cur_q, walk.emit0_counts, &mut walk.memo);
+                if !cv.emitted() && cv.state() == cur_q {
+                    // Every remaining repetition is identical and emits nothing.
+                    break;
+                }
+                cur_q = self.walk_emitted_offsets(walk, child, cur_q, cur_base)?;
+                cur_base += c_len;
+            }
+        }
+        Ok(v.state())
+    }
+
+    /// Collects up to `limit` matching lines of the document rooted at `sym`,
+    /// after `build_line_table`.
+    fn collect_root_lines(
+        &self,
+        transducer: &MealyTransducer,
+        sym: SymbolId,
+        limit: usize,
+        memo: &mut FxHashMap<u64, C>,
+        left_siblings: &mut Vec<(SymbolId, u64)>,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        let root_val = self.table_at(sym);
+        if root_val.emitted() {
+            left_siblings.clear();
+            let _ = self.walk_emitted_lines(sym, 0, limit, memo, left_siblings, &mut lines);
+        }
+        if lines.len() < limit && transducer.eof_emit[root_val.state() as usize] > 0 {
+            // The final line has no trailing '\n': it is the suffix of the whole document.
+            let mut rev_buf = Vec::with_capacity(128);
+            let _ = append_rev_until_nl(self.rules_bytes, sym, &mut rev_buf);
+            rev_buf.reverse();
+            lines.push(String::from_utf8_lossy(&rev_buf).into_owned());
+        }
+        lines
+    }
+
+    fn walk_emitted_lines(
+        &self,
+        sym: SymbolId,
+        q: u16,
+        limit: usize,
+        memo: &mut FxHashMap<u64, C>,
+        left_siblings: &mut Vec<(SymbolId, u64)>,
+        out_lines: &mut Vec<String>,
+    ) -> u16 {
+        let v = self.eval_sym_state(sym, q, memo);
+        let q_out = v.state();
+        if !v.emitted() || out_lines.len() >= limit {
+            return q_out;
+        }
+        if sym.is_terminal() {
+            // `sym` is the emitting '\n': rebuild its line from the left siblings on the stack.
+            let mut rev_buf = Vec::with_capacity(128);
+            'siblings: for &(sib_sym, sib_count) in left_siblings.iter().rev() {
+                for _ in 0..sib_count {
+                    if append_rev_until_nl(self.rules_bytes, sib_sym, &mut rev_buf) {
+                        break 'siblings;
+                    }
+                }
+            }
+            rev_buf.reverse();
+            out_lines.push(String::from_utf8_lossy(&rev_buf).into_owned());
+            return q_out;
+        }
+
+        let packed = self.rule(sym);
+        if !packed.is_run() {
+            let left = SymbolId(packed.word0);
+            let right = SymbolId(packed.word1);
+            let q_mid = self.walk_emitted_lines(left, q, limit, memo, left_siblings, out_lines);
+            if out_lines.len() < limit {
+                left_siblings.push((left, 1));
+                let _ =
+                    self.walk_emitted_lines(right, q_mid, limit, memo, left_siblings, out_lines);
+                left_siblings.pop();
+            }
+        } else {
+            let child = packed.first_sym();
+            let count = packed.word1 as u64;
+            let mut cur_q = q;
+            for i in 0..count {
+                if out_lines.len() >= limit {
+                    break;
+                }
+                let cv = self.eval_sym_state(child, cur_q, memo);
+                let next_q = cv.state();
+                if !cv.emitted() {
+                    if next_q == cur_q {
+                        break;
+                    }
+                    cur_q = next_q;
+                    continue;
+                }
+                if i > 0 {
+                    left_siblings.push((child, i));
+                }
+                cur_q = self.walk_emitted_lines(child, cur_q, limit, memo, left_siblings, out_lines);
+                if i > 0 {
+                    left_siblings.pop();
+                }
+            }
+        }
+        q_out
+    }
 }
 
+/// Mutable state of an emission-offset walk (see `PackedEval::walk_emitted_offsets`).
+struct OffsetWalk<'b, C: PackedCell> {
+    archive: &'b MappedArchive,
+    meta: MappedMeta,
+    emit0_counts: &'b FxHashMap<u32, u64>,
+    memo: FxHashMap<u64, (C, u64)>,
+    limit: usize,
+    out: Vec<u64>,
+}
+
+/// Appends the bytes of `sym` in reverse order to `rev_buf` until a `\n` is reached.
+/// Returns `true` if a `\n` was found.
 fn append_rev_until_nl(rules_bytes: &[u8], sym: SymbolId, rev_buf: &mut Vec<u8>) -> bool {
     if let Some(b) = sym.as_byte() {
         if b == b'\n' {
@@ -468,28 +867,13 @@ fn append_rev_until_nl(rules_bytes: &[u8], sym: SymbolId, rev_buf: &mut Vec<u8>)
         rev_buf.push(b);
         return false;
     }
-    let off = sym.rule_index() * 8;
-    let w0 = u32::from_le_bytes([
-        rules_bytes[off],
-        rules_bytes[off + 1],
-        rules_bytes[off + 2],
-        rules_bytes[off + 3],
-    ]);
-    let w1 = u32::from_le_bytes([
-        rules_bytes[off + 4],
-        rules_bytes[off + 5],
-        rules_bytes[off + 6],
-        rules_bytes[off + 7],
-    ]);
-    if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
-        if append_rev_until_nl(rules_bytes, SymbolId(w1), rev_buf) {
-            return true;
-        }
-        append_rev_until_nl(rules_bytes, SymbolId(w0), rev_buf)
+    let packed = PackedRuleNode::read_at(rules_bytes, sym.rule_index());
+    if !packed.is_run() {
+        append_rev_until_nl(rules_bytes, SymbolId(packed.word1), rev_buf)
+            || append_rev_until_nl(rules_bytes, SymbolId(packed.word0), rev_buf)
     } else {
-        let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
-        let count = w1 as u64;
-        for _ in 0..count {
+        let child = packed.first_sym();
+        for _ in 0..packed.word1 {
             if append_rev_until_nl(rules_bytes, child, rev_buf) {
                 return true;
             }
@@ -498,189 +882,130 @@ fn append_rev_until_nl(rules_bytes: &[u8], sym: SymbolId, rev_buf: &mut Vec<u8>)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn walk_emitted_lines_mapped(
-    sym: SymbolId,
-    q: u16,
-    limit: usize,
-    rules_bytes: &[u8],
-    terminal_packed: &[u8],
-    table: &[u8],
-    memo: &mut FxHashMap<u64, u8>,
-    left_siblings: &mut Vec<(SymbolId, u64)>,
-    out_lines: &mut Vec<String>,
-) -> u16 {
-    let v = eval_sym_state(sym, q, rules_bytes, terminal_packed, table, memo);
-    let q_out = (v & 0x7F) as u16;
-    let has_emit = (v & 0x80) != 0;
-    if !has_emit || out_lines.len() >= limit {
-        return q_out;
-    }
-    if sym.is_terminal() {
-        let mut rev_buf = Vec::with_capacity(128);
-        for &(sib_sym, sib_count) in left_siblings.iter().rev() {
-            let mut hit_nl = false;
-            for _ in 0..sib_count {
-                if append_rev_until_nl(rules_bytes, sib_sym, &mut rev_buf) {
-                    hit_nl = true;
-                    break;
-                }
-            }
-            if hit_nl {
-                break;
-            }
-        }
-        rev_buf.reverse();
-        out_lines.push(String::from_utf8_lossy(&rev_buf).into_owned());
-        return q_out;
-    }
-
-    let off = sym.rule_index() * 8;
-    let w0 = u32::from_le_bytes([
-        rules_bytes[off],
-        rules_bytes[off + 1],
-        rules_bytes[off + 2],
-        rules_bytes[off + 3],
-    ]);
-    let w1 = u32::from_le_bytes([
-        rules_bytes[off + 4],
-        rules_bytes[off + 5],
-        rules_bytes[off + 6],
-        rules_bytes[off + 7],
-    ]);
-
-    if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
-        let left = SymbolId(w0);
-        let right = SymbolId(w1);
-        let q_mid = walk_emitted_lines_mapped(
-            left,
-            q,
-            limit,
-            rules_bytes,
-            terminal_packed,
-            table,
-            memo,
-            left_siblings,
-            out_lines,
-        );
-        if out_lines.len() < limit {
-            left_siblings.push((left, 1));
-            let _ = walk_emitted_lines_mapped(
-                right,
-                q_mid,
-                limit,
-                rules_bytes,
-                terminal_packed,
-                table,
-                memo,
-                left_siblings,
-                out_lines,
-            );
-            left_siblings.pop();
-        }
-        q_out
-    } else {
-        let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
-        let count = w1 as u64;
-        let mut cur_q = q;
-        for i in 0..count {
-            if out_lines.len() >= limit {
-                break;
-            }
-            let cv = eval_sym_state(child, cur_q, rules_bytes, terminal_packed, table, memo);
-            let next_q = (cv & 0x7F) as u16;
-            if (cv & 0x80) == 0 {
-                if next_q == cur_q {
-                    break;
-                }
-                cur_q = next_q;
-                continue;
-            }
-            if i > 0 {
-                left_siblings.push((child, i));
-            }
-            cur_q = walk_emitted_lines_mapped(
-                child,
-                cur_q,
-                limit,
-                rules_bytes,
-                terminal_packed,
-                table,
-                memo,
-                left_siblings,
-                out_lines,
-            );
-            if i > 0 {
-                left_siblings.pop();
-            }
-        }
-        q_out
+#[cold]
+fn too_many_states(pattern: &str, num_states: usize) -> ButtlickError {
+    ButtlickError::InvalidRegex {
+        pattern: pattern.to_string(),
+        message: format!(
+            "pattern compiles to {num_states} DFA states (maximum supported: {})",
+            <u16 as PackedCell>::MAX_STATES
+        ),
     }
 }
 
 impl MappedArchive {
-    fn build_fast_line_table(
+    fn compile_transducer(pattern: &str, mode: GrepMode) -> Result<MealyTransducer> {
+        match mode {
+            GrepMode::LineCount => compile_line_grep_transducer(pattern),
+            GrepMode::MatchCount => compile_match_count_transducer(pattern),
+        }
+    }
+
+    /// Evaluates `transducer` over the whole rule table and returns the total emission count of
+    /// each requested root (in order), picking the narrowest packed cell that fits the state count.
+    pub(crate) fn count_emissions(
         &self,
         transducer: &MealyTransducer,
-    ) -> (Vec<u8>, Vec<u8>, FxHashMap<u64, u8>) {
-        let s = transducer.num_states;
-        let mut terminal_packed = vec![0u8; s * 256];
-        for q in 0..s {
-            for b in 0..=255usize {
-                let idx = q * 256 + b;
-                let nq = transducer.byte_next[idx] as u8;
-                let em = if transducer.byte_emit[idx] > 0 {
-                    0x80
-                } else {
-                    0
-                };
-                terminal_packed[idx] = nq | em;
-            }
+        roots: &[Option<SymbolId>],
+        pattern: &str,
+    ) -> Result<Vec<u64>> {
+        fn run<C: PackedCell>(
+            archive: &MappedArchive,
+            transducer: &MealyTransducer,
+            roots: &[Option<SymbolId>],
+        ) -> Result<Vec<u64>> {
+            let mut eval = PackedEval::<C>::new(archive, transducer);
+            let emit0_counts = eval.build_count_table()?;
+            Ok(roots
+                .iter()
+                .map(|r| r.map_or(0, |sym| eval.root_count(transducer, sym, &emit0_counts)))
+                .collect())
         }
+        match transducer.num_states {
+            n if n <= <u8 as PackedCell>::MAX_STATES => run::<u8>(self, transducer, roots),
+            n if n <= <u16 as PackedCell>::MAX_STATES => run::<u16>(self, transducer, roots),
+            n => Err(too_many_states(pattern, n)),
+        }
+    }
 
-        let rules_bytes = self.rules_bytes();
-        let mut table = vec![0u8; 256 + self.num_rules];
-        table[0..256].copy_from_slice(&terminal_packed[0..256]);
-        let mut memo: FxHashMap<u64, u8> = FxHashMap::default();
+    /// Returns the total emission count of the document rooted at `root` together with the
+    /// document offsets of its first `limit` emitting bytes (stream emissions only; end-of-file
+    /// emissions are not located).
+    pub(crate) fn locate_emissions(
+        &self,
+        transducer: &MealyTransducer,
+        root: SymbolId,
+        limit: usize,
+        pattern: &str,
+    ) -> Result<(u64, Vec<u64>)> {
+        fn run<C: PackedCell>(
+            archive: &MappedArchive,
+            transducer: &MealyTransducer,
+            root: SymbolId,
+            limit: usize,
+        ) -> Result<(u64, Vec<u64>)> {
+            let mut eval = PackedEval::<C>::new(archive, transducer);
+            let emit0_counts = eval.build_count_table()?;
+            let total = eval.root_count(transducer, root, &emit0_counts);
+            let limit = limit.min(usize::try_from(total).unwrap_or(usize::MAX));
+            let mut walk = OffsetWalk {
+                archive,
+                meta: archive.navigation_meta()?,
+                emit0_counts: &emit0_counts,
+                memo: FxHashMap::default(),
+                limit,
+                out: Vec::with_capacity(limit.min(1 << 20)),
+            };
+            if limit > 0 {
+                eval.walk_emitted_offsets(&mut walk, root, 0, 0)?;
+            }
+            Ok((total, walk.out))
+        }
+        match transducer.num_states {
+            n if n <= <u8 as PackedCell>::MAX_STATES => run::<u8>(self, transducer, root, limit),
+            n if n <= <u16 as PackedCell>::MAX_STATES => run::<u16>(self, transducer, root, limit),
+            n => Err(too_many_states(pattern, n)),
+        }
+    }
 
-        for (idx, chunk) in rules_bytes.chunks_exact(8).enumerate() {
-            let w0 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let w1 = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-            let sym_idx = 256 + idx;
-            if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
-                let l_val = unsafe { *table.get_unchecked(w0 as usize) };
-                if (l_val & 0x7F) == 0 {
-                    let r_val = unsafe { *table.get_unchecked(w1 as usize) };
-                    unsafe {
-                        *table.get_unchecked_mut(sym_idx) = r_val | l_val;
-                    }
-                } else {
-                    let q_mid = (l_val & 0x7F) as u16;
-                    let r_val = eval_sym_state(
-                        SymbolId(w1),
-                        q_mid,
-                        rules_bytes,
-                        &terminal_packed,
-                        &table,
-                        &mut memo,
-                    );
-                    table[sym_idx] = r_val | (l_val & 0x80);
+    /// Collects up to `limit` matching lines across the given `(name, root)` documents in order.
+    fn collect_lines(
+        &self,
+        transducer: &MealyTransducer,
+        docs: &[(&str, SymbolId)],
+        limit: usize,
+        pattern: &str,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        fn run<C: PackedCell>(
+            archive: &MappedArchive,
+            transducer: &MealyTransducer,
+            docs: &[(&str, SymbolId)],
+            limit: usize,
+        ) -> Result<Vec<(String, Vec<String>)>> {
+            let mut eval = PackedEval::<C>::new(archive, transducer);
+            let mut memo: FxHashMap<u64, C> = FxHashMap::default();
+            eval.build_line_table(&mut memo)?;
+            let mut left_siblings = Vec::with_capacity(32);
+            let mut results = Vec::new();
+            let mut remaining = limit;
+            for &(name, sym) in docs {
+                if remaining == 0 {
+                    break;
                 }
-            } else {
-                let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
-                table[sym_idx] = eval_run_state(
-                    child,
-                    w1 as u64,
-                    0,
-                    rules_bytes,
-                    &terminal_packed,
-                    &table,
-                    &mut memo,
-                );
+                let lines =
+                    eval.collect_root_lines(transducer, sym, remaining, &mut memo, &mut left_siblings);
+                if !lines.is_empty() {
+                    remaining = remaining.saturating_sub(lines.len());
+                    results.push((name.to_string(), lines));
+                }
             }
+            Ok(results)
         }
-
-        (terminal_packed, table, memo)
+        match transducer.num_states {
+            n if n <= <u8 as PackedCell>::MAX_STATES => run::<u8>(self, transducer, docs, limit),
+            n if n <= <u16 as PackedCell>::MAX_STATES => run::<u16>(self, transducer, docs, limit),
+            n => Err(too_many_states(pattern, n)),
+        }
     }
 
     /// Zero-copy, 1-byte-per-symbol extraction of matching lines on a single document.
@@ -695,33 +1020,8 @@ impl MappedArchive {
             return Ok(Vec::new());
         };
         let transducer = compile_line_grep_transducer(pattern)?;
-        let (terminal_packed, table, mut memo) = self.build_fast_line_table(&transducer);
-        let rules_bytes = self.rules_bytes();
-        let mut out_lines = Vec::new();
-        let mut left_siblings = Vec::with_capacity(32);
-
-        let root_val = table[sym.0 as usize];
-        let final_q = (root_val & 0x7F) as usize;
-        if (root_val & 0x80) != 0 {
-            let _ = walk_emitted_lines_mapped(
-                sym,
-                0,
-                limit,
-                rules_bytes,
-                &terminal_packed,
-                &table,
-                &mut memo,
-                &mut left_siblings,
-                &mut out_lines,
-            );
-        }
-        if out_lines.len() < limit && transducer.eof_emit[final_q] > 0 {
-            let mut rev_buf = Vec::with_capacity(128);
-            let _ = append_rev_until_nl(rules_bytes, sym, &mut rev_buf);
-            rev_buf.reverse();
-            out_lines.push(String::from_utf8_lossy(&rev_buf).into_owned());
-        }
-        Ok(out_lines)
+        let mut results = self.collect_lines(&transducer, &[(&root.name, sym)], limit, pattern)?;
+        Ok(results.pop().map(|(_, lines)| lines).unwrap_or_default())
     }
 
     /// Zero-copy, 1-byte-per-symbol extraction of matching lines across ALL documents in the archive.
@@ -731,323 +1031,35 @@ impl MappedArchive {
         limit: usize,
     ) -> Result<Vec<(String, Vec<String>)>> {
         let transducer = compile_line_grep_transducer(pattern)?;
-        let (terminal_packed, table, mut memo) = self.build_fast_line_table(&transducer);
-        let rules_bytes = self.rules_bytes();
-        let mut results = Vec::new();
-        let mut remaining = limit;
-        let mut left_siblings = Vec::with_capacity(32);
-
-        for root in &self.roots {
-            if remaining == 0 {
-                break;
-            }
-            let Some(sym) = root.root_symbol else {
-                continue;
-            };
-            let root_val = table[sym.0 as usize];
-            let final_q = (root_val & 0x7F) as usize;
-            let has_eof = transducer.eof_emit[final_q] > 0;
-            if (root_val & 0x80) == 0 && !has_eof {
-                continue;
-            }
-            let mut doc_lines = Vec::new();
-            if (root_val & 0x80) != 0 {
-                left_siblings.clear();
-                let _ = walk_emitted_lines_mapped(
-                    sym,
-                    0,
-                    remaining,
-                    rules_bytes,
-                    &terminal_packed,
-                    &table,
-                    &mut memo,
-                    &mut left_siblings,
-                    &mut doc_lines,
-                );
-            }
-            if doc_lines.len() < remaining && has_eof {
-                let mut rev_buf = Vec::with_capacity(128);
-                let _ = append_rev_until_nl(rules_bytes, sym, &mut rev_buf);
-                rev_buf.reverse();
-                doc_lines.push(String::from_utf8_lossy(&rev_buf).into_owned());
-            }
-            if !doc_lines.is_empty() {
-                remaining = remaining.saturating_sub(doc_lines.len());
-                results.push((root.name.clone(), doc_lines));
-            }
-        }
-        Ok(results)
-    }
-
-    fn build_fast_count_table(
-        &self,
-        transducer: &MealyTransducer,
-    ) -> (Vec<u8>, FxHashMap<u32, u64>) {
-        let s = transducer.num_states;
-        let mut terminal_packed = vec![0u8; s * 256];
-        for q in 0..s {
-            for b in 0..=255usize {
-                let idx = q * 256 + b;
-                let nq = transducer.byte_next[idx] as u8;
-                let em = if transducer.byte_emit[idx] > 0 {
-                    0x80
-                } else {
-                    0
-                };
-                terminal_packed[idx] = nq | em;
-            }
-        }
-
-        let rules_bytes = self.rules_bytes();
-        let mut table = vec![0u8; 256 + self.num_rules];
-        table[0..256].copy_from_slice(&terminal_packed[0..256]);
-        let mut emit0_counts: FxHashMap<u32, u64> = FxHashMap::default();
-        let mut memo: FxHashMap<u64, (u8, u64)> = FxHashMap::default();
-
-        for (idx, chunk) in rules_bytes.chunks_exact(8).enumerate() {
-            let w0 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            let w1 = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-            let sym_idx = 256 + idx;
-            if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
-                let l_val = unsafe { *table.get_unchecked(w0 as usize) };
-                if (l_val & 0x7F) == 0 {
-                    let r_val = unsafe { *table.get_unchecked(w1 as usize) };
-                    let out_val = r_val | l_val;
-                    unsafe {
-                        *table.get_unchecked_mut(sym_idx) = out_val;
-                    }
-                    if (out_val & 0x80) != 0 {
-                        let lc = if (l_val & 0x80) == 0 {
-                            0
-                        } else if w0 < 256 {
-                            1
-                        } else {
-                            emit0_counts[&w0]
-                        };
-                        let rc = if (r_val & 0x80) == 0 {
-                            0
-                        } else if w1 < 256 {
-                            1
-                        } else {
-                            emit0_counts[&w1]
-                        };
-                        emit0_counts.insert(sym_idx as u32, lc + rc);
-                    }
-                } else {
-                    let q_mid = (l_val & 0x7F) as u16;
-                    let lc = if (l_val & 0x80) == 0 {
-                        0
-                    } else if w0 < 256 {
-                        1
-                    } else {
-                        emit0_counts[&w0]
-                    };
-                    let (r_val, rc) = eval_sym_count_state(
-                        SymbolId(w1),
-                        q_mid,
-                        rules_bytes,
-                        &terminal_packed,
-                        &table,
-                        &emit0_counts,
-                        &mut memo,
-                    );
-                    let out_val = r_val | (l_val & 0x80);
-                    table[sym_idx] = out_val;
-                    if (out_val & 0x80) != 0 {
-                        emit0_counts.insert(sym_idx as u32, lc + rc);
-                    }
-                }
-            } else {
-                let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
-                let (out_val, c) = eval_run_count_state(
-                    child,
-                    w1 as u64,
-                    0,
-                    rules_bytes,
-                    &terminal_packed,
-                    &table,
-                    &emit0_counts,
-                    &mut memo,
-                );
-                table[sym_idx] = out_val;
-                if (out_val & 0x80) != 0 {
-                    emit0_counts.insert(sym_idx as u32, c);
-                }
-            }
-        }
-
-        (table, emit0_counts)
+        let docs: Vec<(&str, SymbolId)> = self
+            .roots
+            .iter()
+            .filter_map(|r| r.root_symbol.map(|sym| (r.name.as_str(), sym)))
+            .collect();
+        self.collect_lines(&transducer, &docs, limit, pattern)
     }
 
     pub fn grep(&self, doc_name: Option<&str>, pattern: &str, mode: GrepMode) -> Result<u64> {
         let root = self.find_root(doc_name)?;
-        let Some(sym) = root.root_symbol else {
+        if root.root_symbol.is_none() {
             return Ok(0);
-        };
-        let transducer = match mode {
-            GrepMode::LineCount => compile_line_grep_transducer(pattern)?,
-            GrepMode::MatchCount => compile_match_count_transducer(pattern)?,
-        };
-        let (table, emit0_counts) = self.build_fast_count_table(&transducer);
-        let root_val = table[sym.0 as usize];
-        let final_q = (root_val & 0x7F) as usize;
-        let stream_c = if (root_val & 0x80) == 0 {
-            0
-        } else if sym.0 < 256 {
-            1
-        } else {
-            emit0_counts[&sym.0]
-        };
-        Ok(stream_c + transducer.eof_emit[final_q])
+        }
+        let transducer = Self::compile_transducer(pattern, mode)?;
+        let counts = self.count_emissions(&transducer, &[root.root_symbol], pattern)?;
+        Ok(counts[0])
     }
 
     pub fn grep_all_docs(&self, pattern: &str, mode: GrepMode) -> Result<Vec<(String, u64)>> {
-        let transducer = match mode {
-            GrepMode::LineCount => compile_line_grep_transducer(pattern)?,
-            GrepMode::MatchCount => compile_match_count_transducer(pattern)?,
-        };
-        let (table, emit0_counts) = self.build_fast_count_table(&transducer);
-        let mut results = Vec::with_capacity(self.roots.len());
-        for root in &self.roots {
-            let c = match root.root_symbol {
-                None => 0,
-                Some(sym) => {
-                    let root_val = table[sym.0 as usize];
-                    let final_q = (root_val & 0x7F) as usize;
-                    let stream_c = if (root_val & 0x80) == 0 {
-                        0
-                    } else if sym.0 < 256 {
-                        1
-                    } else {
-                        emit0_counts[&sym.0]
-                    };
-                    stream_c + transducer.eof_emit[final_q]
-                }
-            };
-            results.push((root.name.clone(), c));
-        }
-        Ok(results)
+        let transducer = Self::compile_transducer(pattern, mode)?;
+        let roots: Vec<Option<SymbolId>> = self.roots.iter().map(|r| r.root_symbol).collect();
+        let counts = self.count_emissions(&transducer, &roots, pattern)?;
+        Ok(self
+            .roots
+            .iter()
+            .zip(counts)
+            .map(|(r, c)| (r.name.clone(), c))
+            .collect())
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn eval_sym_count_state(
-    sym: SymbolId,
-    q: u16,
-    rules_bytes: &[u8],
-    terminal_packed: &[u8],
-    table: &[u8],
-    emit0_counts: &FxHashMap<u32, u64>,
-    memo: &mut FxHashMap<u64, (u8, u64)>,
-) -> (u8, u64) {
-    if q == 0 {
-        let v = unsafe { *table.get_unchecked(sym.0 as usize) };
-        let c = if (v & 0x80) == 0 {
-            0
-        } else if sym.0 < 256 {
-            1
-        } else {
-            emit0_counts[&sym.0]
-        };
-        return (v, c);
-    }
-    if let Some(b) = sym.as_byte() {
-        let v = terminal_packed[(q as usize) * 256 + (b as usize)];
-        return (v, ((v & 0x80) != 0) as u64);
-    }
-    let key = ((sym.0 as u64) << 16) | (q as u64);
-    if let Some(&cached) = memo.get(&key) {
-        return cached;
-    }
-    let off = sym.rule_index() * 8;
-    let w0 = u32::from_le_bytes([
-        rules_bytes[off],
-        rules_bytes[off + 1],
-        rules_bytes[off + 2],
-        rules_bytes[off + 3],
-    ]);
-    let w1 = u32::from_le_bytes([
-        rules_bytes[off + 4],
-        rules_bytes[off + 5],
-        rules_bytes[off + 6],
-        rules_bytes[off + 7],
-    ]);
-    let res = if (w0 & PackedRuleNode::RUN_TAG_BIT) == 0 {
-        let (l_val, lc) = eval_sym_count_state(
-            SymbolId(w0),
-            q,
-            rules_bytes,
-            terminal_packed,
-            table,
-            emit0_counts,
-            memo,
-        );
-        let q_mid = (l_val & 0x7F) as u16;
-        let (r_val, rc) = eval_sym_count_state(
-            SymbolId(w1),
-            q_mid,
-            rules_bytes,
-            terminal_packed,
-            table,
-            emit0_counts,
-            memo,
-        );
-        (r_val | (l_val & 0x80), lc + rc)
-    } else {
-        let child = SymbolId(w0 & !PackedRuleNode::RUN_TAG_BIT);
-        eval_run_count_state(
-            child,
-            w1 as u64,
-            q,
-            rules_bytes,
-            terminal_packed,
-            table,
-            emit0_counts,
-            memo,
-        )
-    };
-    memo.insert(key, res);
-    res
-}
-
-#[allow(clippy::too_many_arguments)]
-fn eval_run_count_state(
-    child: SymbolId,
-    count: u64,
-    q: u16,
-    rules_bytes: &[u8],
-    terminal_packed: &[u8],
-    table: &[u8],
-    emit0_counts: &FxHashMap<u32, u64>,
-    memo: &mut FxHashMap<u64, (u8, u64)>,
-) -> (u8, u64) {
-    let mut cur_q = q;
-    let mut emitted_flag = 0u8;
-    let mut total_c = 0u64;
-    for i in 0..count {
-        let (v, c) = eval_sym_count_state(
-            child,
-            cur_q,
-            rules_bytes,
-            terminal_packed,
-            table,
-            emit0_counts,
-            memo,
-        );
-        let next_q = (v & 0x7F) as u16;
-        if next_q == cur_q {
-            let rem = count - i;
-            if c > 0 {
-                emitted_flag |= 0x80;
-                total_c += rem * c;
-            }
-            break;
-        }
-        emitted_flag |= v & 0x80;
-        total_c += c;
-        cur_q = next_q;
-    }
-    ((cur_q as u8) | emitted_flag, total_c)
 }
 
 #[cfg(test)]

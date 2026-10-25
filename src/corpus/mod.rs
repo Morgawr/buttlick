@@ -5,8 +5,9 @@ use crate::engine::regex_compile::{
     compile_line_grep_transducer, compile_match_count_transducer, GrepMode,
 };
 use crate::error::{ButtlickError, Result};
-use crate::format::header::{BTLK_HEADER_SIZE, PACKED_RULE_SIZE};
-use crate::grammar::{GrammarDag, RuleKind};
+use crate::format::header::{PackedRuleNode, BTLK_HEADER_SIZE, PACKED_RULE_SIZE};
+use crate::format::MappedArchive;
+use crate::grammar::{GrammarDag, RootEntry, RuleKind, SymbolId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RootReport {
@@ -29,6 +30,92 @@ pub struct InspectReport {
     pub roots: Vec<RootReport>,
 }
 
+fn build_inspect_report(
+    roots: &[RootEntry],
+    height_of: impl Fn(SymbolId) -> u16,
+    num_rules: usize,
+    num_pair_rules: usize,
+    num_run_rules: usize,
+    archive_bytes: u64,
+) -> InspectReport {
+    let roots_report: Vec<RootReport> = roots
+        .iter()
+        .map(|r| RootReport {
+            name: r.name.clone(),
+            byte_len: r.byte_len,
+            kr_hash_hex: format!("0x{:016x}", r.kr_hash),
+            height: r.root_symbol.map(&height_of).unwrap_or(0),
+        })
+        .collect();
+    let total_uncompressed_bytes: u64 = roots.iter().map(|r| r.byte_len).sum();
+    let compression_ratio = if archive_bytes > 0 {
+        (total_uncompressed_bytes as f64) / (archive_bytes as f64)
+    } else {
+        1.0
+    };
+    InspectReport {
+        num_roots: roots.len(),
+        num_rules,
+        num_pair_rules,
+        num_run_rules,
+        max_height: roots_report.iter().map(|r| r.height).max().unwrap_or(0),
+        total_uncompressed_bytes,
+        archive_bytes,
+        compression_ratio,
+        roots: roots_report,
+    }
+}
+
+impl MappedArchive {
+    /// Inspection report computed directly on the memory-mapped archive: verifies the footer
+    /// checksum and derives rule heights in one sequential pass (2 bytes per rule) instead of
+    /// decoding the whole `GrammarDag`.
+    pub fn inspect_report(&self, archive_bytes: u64) -> Result<InspectReport> {
+        self.verify_checksum()?;
+        let mut heights = vec![0u16; self.num_rules];
+        let mut num_pair_rules = 0usize;
+        let mut num_run_rules = 0usize;
+        let height = |sym: SymbolId, heights: &[u16]| -> u16 {
+            if sym.is_terminal() {
+                0
+            } else {
+                heights[sym.rule_index()]
+            }
+        };
+        for (idx, chunk) in self.rules_bytes().chunks_exact(PACKED_RULE_SIZE).enumerate() {
+            let p = PackedRuleNode::from_bytes(chunk.try_into().unwrap());
+            let sym_id = SymbolId::from_rule_index(idx).0;
+            heights[idx] = if p.is_run() {
+                num_run_rules += 1;
+                if p.first_sym().0 >= sym_id || p.word1 < 2 {
+                    return Err(ButtlickError::CorruptedFormat(format!(
+                        "Invalid Run rule at index {idx}"
+                    )));
+                }
+                height(p.first_sym(), &heights).saturating_add(1)
+            } else {
+                num_pair_rules += 1;
+                if p.word0 >= sym_id || p.word1 >= sym_id {
+                    return Err(ButtlickError::CorruptedFormat(format!(
+                        "Topological ordering violation at rule {idx}"
+                    )));
+                }
+                height(SymbolId(p.word0), &heights)
+                    .max(height(SymbolId(p.word1), &heights))
+                    .saturating_add(1)
+            };
+        }
+        Ok(build_inspect_report(
+            &self.roots,
+            |sym| height(sym, &heights),
+            self.num_rules,
+            num_pair_rules,
+            num_run_rules,
+            archive_bytes,
+        ))
+    }
+}
+
 impl GrammarDag {
     /// Generates a comprehensive structural and statistical inspection report of the DAG.
     pub fn inspect_report(&self, archive_bytes_override: Option<u64>) -> InspectReport {
@@ -41,18 +128,6 @@ impl GrammarDag {
             }
         }
 
-        let roots: Vec<RootReport> = self
-            .roots
-            .iter()
-            .map(|r| RootReport {
-                name: r.name.clone(),
-                byte_len: r.byte_len,
-                kr_hash_hex: format!("0x{:016x}", r.kr_hash),
-                height: r.root_symbol.map(|s| self.sym_height(s)).unwrap_or(0),
-            })
-            .collect();
-
-        let total_uncompressed_bytes = self.total_uncompressed_bytes();
         let estimated_roots_bytes: usize =
             self.roots.iter().map(|r| 32 + r.name.len()).sum::<usize>();
         let aligned_roots_bytes = (estimated_roots_bytes + 7) & !7;
@@ -61,23 +136,14 @@ impl GrammarDag {
                 as u64,
         );
 
-        let compression_ratio = if archive_bytes > 0 {
-            (total_uncompressed_bytes as f64) / (archive_bytes as f64)
-        } else {
-            1.0
-        };
-
-        InspectReport {
-            num_roots: self.roots.len(),
-            num_rules: self.rules.len(),
+        build_inspect_report(
+            &self.roots,
+            |sym| self.sym_height(sym),
+            self.rules.len(),
             num_pair_rules,
             num_run_rules,
-            max_height: self.max_height(),
-            total_uncompressed_bytes,
             archive_bytes,
-            compression_ratio,
-            roots,
-        }
+        )
     }
 
     /// Evaluates an exact substring count across ALL documents in the archive in a SINGLE
