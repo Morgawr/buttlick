@@ -127,6 +127,7 @@ dependencies = [
  "rayon",
  "regex",
  "regex-automata",
+ "regex-syntax",
  "rustc-hash",
  "serde",
  "serde_json",

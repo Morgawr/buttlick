@@ -8,7 +8,7 @@
 use crate::error::{ButtlickError, Result};
 use crate::format::header::{PackedRuleNode, PACKED_RULE_SIZE};
 use crate::format::MappedArchive;
-use crate::grammar::{repeat_tail, RootEntry, SymbolId};
+use crate::grammar::{check_range, repeat_tail, RootEntry, SymbolId};
 use crate::hash::{byte_hash, checksum64, combine_hashes, mod_mul, repeat_hash_and_pow, HASH_BASE};
 
 /// Lazily memoized per-rule metadata for navigating a `MappedArchive`.
@@ -27,6 +27,33 @@ fn corrupt_rule(sym: SymbolId) -> ButtlickError {
 }
 
 impl MappedArchive {
+    /// Rules reachable from `root`, sorted into topological order. Decode only visited rules,
+    /// so a small document in a large archive does not fault in the entire rule table.
+    pub(crate) fn reachable_rules(&self, root: SymbolId) -> Result<Vec<usize>> {
+        let mut bits = vec![0u64; self.num_rules.div_ceil(64)];
+        let mut stack = vec![root];
+        let mut indices = Vec::new();
+        while let Some(sym) = stack.pop() {
+            if sym.is_terminal() {
+                continue;
+            }
+            let idx = sym.rule_index();
+            let packed = self.checked_rule(sym)?;
+            let bit = 1u64 << (idx % 64);
+            if bits[idx / 64] & bit != 0 {
+                continue;
+            }
+            bits[idx / 64] |= bit;
+            indices.push(idx);
+            stack.push(packed.first_sym());
+            if !packed.is_run() {
+                stack.push(SymbolId(packed.word1));
+            }
+        }
+        indices.sort_unstable();
+        Ok(indices)
+    }
+
     /// Creates an empty lazily-populated metadata cache for this archive.
     pub fn new_meta(&self) -> MappedMeta {
         MappedMeta {
@@ -370,18 +397,6 @@ impl MappedArchive {
         }
         Ok(())
     }
-}
-
-/// Bounds check shared by slice / equality queries.
-fn check_range(root: &RootEntry, start: u64, len: u64) -> Result<()> {
-    if start.saturating_add(len) > root.byte_len {
-        return Err(ButtlickError::OutOfBounds {
-            offset: start,
-            len,
-            total: root.byte_len,
-        });
-    }
-    Ok(())
 }
 
 #[inline]

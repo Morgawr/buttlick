@@ -288,5 +288,5 @@ fn test_all_10_cli_subcommands_end_to_end() {
         .unwrap();
     assert!(out.status.success());
     let b_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(b_json["benchmarks"].as_array().unwrap().len(), 4);
+    assert_eq!(b_json["benchmarks"].as_array().unwrap().len(), 8);
 }

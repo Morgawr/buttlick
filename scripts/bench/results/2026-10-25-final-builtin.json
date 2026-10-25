@@ -1,0 +1,66 @@
+{
+  "uncompressed_bytes": 1048576,
+  "archive_bytes": 7448,
+  "num_rules": 917,
+  "dag_height": 22,
+  "compression_ratio": 140.78625134264232,
+  "compress_ms": 3.8840250000000003,
+  "benchmarks": [
+    {
+      "operation": "Exact Substring Count ('ERROR')",
+      "buttlick_us": 50,
+      "raw_scan_us": 491,
+      "speedup_x": 9.82,
+      "verified_result": "count=695"
+    },
+    {
+      "operation": "O(log N) Substring Equality (1 MB span)",
+      "buttlick_us": 9,
+      "raw_scan_us": 14,
+      "speedup_x": 1.5555555555555556,
+      "verified_result": "equal=true"
+    },
+    {
+      "operation": "Regex Line Grep ('status=500.*latency=[0-9]+')",
+      "buttlick_us": 627,
+      "raw_scan_us": 922,
+      "speedup_x": 1.470494417862839,
+      "verified_result": "lines=695"
+    },
+    {
+      "operation": "Structured Analytics (SUM/MIN/MAX WHERE status=200)",
+      "buttlick_us": 94,
+      "raw_scan_us": 1168,
+      "speedup_x": 12.425531914893616,
+      "verified_result": "count=15287, sum=339441"
+    },
+    {
+      "operation": "Mapped Exact Substring Count ('ERROR')",
+      "buttlick_us": 28,
+      "raw_scan_us": 491,
+      "speedup_x": 17.535714285714285,
+      "verified_result": "count=695"
+    },
+    {
+      "operation": "Mapped Substring Equality",
+      "buttlick_us": 22,
+      "raw_scan_us": 14,
+      "speedup_x": 0.6363636363636364,
+      "verified_result": "equal=true"
+    },
+    {
+      "operation": "Mapped Regex Line Grep",
+      "buttlick_us": 346,
+      "raw_scan_us": 922,
+      "speedup_x": 2.6647398843930636,
+      "verified_result": "lines=695"
+    },
+    {
+      "operation": "Mapped Structured Analytics",
+      "buttlick_us": 195,
+      "raw_scan_us": 1168,
+      "speedup_x": 5.98974358974359,
+      "verified_result": "count=15287, sum=339441"
+    }
+  ]
+}

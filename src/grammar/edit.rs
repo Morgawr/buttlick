@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 
 use crate::engine::kmp_seam::{build_kmp_table, KmpDagIndex};
 use crate::error::{ButtlickError, Result};
-use crate::grammar::{GrammarDag, RootEntry, RuleKind, SymbolId};
+use crate::grammar::{check_range, GrammarDag, RootEntry, RuleKind, SymbolId};
 
 /// Finds the starting index of the FIRST match of `pattern` in `haystack` using KMP.
 #[inline]
@@ -36,6 +36,14 @@ struct RewriteChunk {
 }
 
 impl GrammarDag {
+    fn prepare_edit_interner(&mut self, roots: impl IntoIterator<Item = SymbolId>) {
+        if self.interner.len() != self.rules.len() {
+            self.interner.clear_tables();
+        }
+        let indices = self.reachable_rules(roots);
+        self.interner.index_selected(&self.rules, &indices);
+    }
+
     /// Concatenates two optional symbols in $O(\log N)$ time while maintaining height balance
     /// and canonical hash-consing (automatically coalescing runs of identical symbols).
     pub fn concat_symbols(
@@ -172,7 +180,7 @@ impl GrammarDag {
         new_sym: Option<SymbolId>,
     ) -> Result<()> {
         let (byte_len, kr_hash) = match new_sym {
-            Some(s) => (self.sym_len(s), self.sym_hash(s)),
+            Some(s) => (self.sym_len(s), self.sym_hash_reachable(s)),
             None => (0, 0),
         };
         let root = self.find_root_mut(doc_name)?;
@@ -195,7 +203,13 @@ impl GrammarDag {
         if bytes.is_empty() {
             return Ok(());
         }
+        root.byte_len
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| {
+                ButtlickError::InvalidQuery("inserted document exceeds the u64 length limit".into())
+            })?;
         let root_sym = root.root_symbol;
+        self.prepare_edit_interner(root_sym);
         let mid_sym = self.compress_bytes(bytes);
 
         let new_root = match root_sym {
@@ -212,17 +226,12 @@ impl GrammarDag {
     /// Deletes the byte range `[offset, offset + len)` from a named document in $O(\log N)$ time.
     pub fn delete(&mut self, doc_name: Option<&str>, offset: u64, len: u64) -> Result<()> {
         let root = self.find_root(doc_name)?;
-        if offset.saturating_add(len) > root.byte_len {
-            return Err(ButtlickError::OutOfBounds {
-                offset,
-                len,
-                total: root.byte_len,
-            });
-        }
+        check_range(root, offset, len)?;
         if len == 0 {
             return Ok(());
         }
         let sym = root.root_symbol.unwrap();
+        self.prepare_edit_interner([sym]);
         let (left, rest) = self.split_symbol(sym, offset);
         let right = match rest {
             Some(r_sym) => self.split_symbol(r_sym, len).1,
@@ -239,11 +248,20 @@ impl GrammarDag {
         doc2: &str,
         new_name: impl Into<String>,
     ) -> Result<RootEntry> {
+        self.find_root(Some(doc1))?
+            .byte_len
+            .checked_add(self.find_root(Some(doc2))?.byte_len)
+            .ok_or_else(|| {
+                ButtlickError::InvalidQuery(
+                    "concatenated document exceeds the u64 length limit".into(),
+                )
+            })?;
         let sym1 = self.find_root(Some(doc1))?.root_symbol;
         let sym2 = self.find_root(Some(doc2))?.root_symbol;
+        self.prepare_edit_interner(sym1.into_iter().chain(sym2));
         let new_sym = self.concat_symbols(sym1, sym2);
         let (byte_len, kr_hash) = match new_sym {
-            Some(s) => (self.sym_len(s), self.sym_hash(s)),
+            Some(s) => (self.sym_len(s), self.sym_hash_reachable(s)),
             None => (0, 0),
         };
         let entry = RootEntry {
@@ -275,11 +293,12 @@ impl GrammarDag {
             return Ok(0);
         }
 
-        let repl_sym = self.compress_bytes(replacement);
-        let kmp_index = KmpDagIndex::evaluate(self, pattern)?;
+        let kmp_index = KmpDagIndex::evaluate_root(self, pattern, root_sym)?;
         if kmp_index.count_symbol(root_sym) == 0 {
             return Ok(0);
         }
+        self.prepare_edit_interner([root_sym]);
+        let repl_sym = self.compress_bytes(replacement);
 
         let m = pattern.len();
         if m == 1 {
@@ -317,7 +336,7 @@ impl GrammarDag {
                 return (Some(sym), 0);
             }
         }
-        if (sym.rule_index() < kmp_index.single_counts.len()) && kmp_index.count_symbol(sym) == 0 {
+        if kmp_index.contains(sym) && kmp_index.count_symbol(sym) == 0 {
             return (Some(sym), 0);
         }
         let kind = self.rule(sym).kind;
@@ -362,9 +381,7 @@ impl GrammarDag {
         }
 
         // Fast path for pre-existing DAG nodes that have 0 matches of `pattern`
-        let idx = sym.rule_index();
-        if idx < kmp_index.summaries.len() && kmp_index.summaries[idx].match_count == 0 {
-            let sum = &kmp_index.summaries[idx];
+        if let Some(sum) = kmp_index.summary(sym).filter(|s| s.match_count == 0) {
             let chunk = RewriteChunk {
                 orig_sym: Some(sym),
                 rewritten_sym: Some(sym),

@@ -1,0 +1,11 @@
+final  slurp -c EXPORT_SYMBOL_GPL                  1.118s     1403.6 MB  out=fe636899f20a len=140775 rc=0
+final  slurp -n kfree_rcu\( limit50                0.600s     1355.3 MB  out=a29d1b8c2a48 len=4691 rc=0
+final  slurp -n doc core.c                         0.020s       55.8 MB  out=eafca7d3fea7 len=117 rc=0
+final  slurp --match-count mutex                   1.024s     1388.0 MB  out=076f8eacd581 len=237029 rc=0
+final  count --all mutex_lock(                     2.591s     1573.6 MB  out=5dcfcbdb8822 len=2317 rc=0
+final  count offsets doc                           0.022s       57.8 MB  out=80d199689b8b len=105 rc=0
+final  slice                                       0.026s       63.7 MB  out=64ac2f480a83 len=256 rc=0
+final  inspect --json                              1.466s     1504.8 MB  out=b7a5f762fbe7 len=15742259 rc=0
+final  query col                                   0.042s       46.9 MB  out=770c087e2e7a len=66 rc=0
+final  decompress --out-dir                        2.967s     1318.2 MB  out=da39a3ee5e6b len=0 rc=0
+final  roundtrip diff unexpected=0 []

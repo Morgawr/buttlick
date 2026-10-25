@@ -102,11 +102,10 @@ impl RuleInterner {
             let sym = SymbolId::from_rule_index(idx);
             match node.kind {
                 RuleKind::Pair { left, right } => {
-                    if should_intern_pair_globally(node) {
-                        interner
-                            .pair_map
-                            .insert(Self::pack_pair_key(left, right), sym);
-                    }
+                    interner
+                        .pair_map
+                        .entry(Self::pack_pair_key(left, right))
+                        .or_insert(sym);
                 }
                 RuleKind::Run { child, count } => {
                     interner.run_map.insert((child, count), sym);
@@ -114,7 +113,28 @@ impl RuleInterner {
             }
         }
         interner.indexed_rules = rules.len();
+        interner.seed_rules_len = rules.len();
         interner
+    }
+
+    /// Adds the full structural dictionary of a selected sub-DAG for editing. Unlike bulk
+    /// ingestion, editing must also reuse long pairs after loading an archive.
+    pub(crate) fn index_selected(&mut self, rules: &[RuleNode], indices: &[usize]) {
+        for &idx in indices {
+            let sym = SymbolId::from_rule_index(idx);
+            match rules[idx].kind {
+                RuleKind::Pair { left, right } => {
+                    self.pair_map
+                        .entry(Self::pack_pair_key(left, right))
+                        .or_insert(sym);
+                }
+                RuleKind::Run { child, count } => {
+                    self.run_map.entry((child, count)).or_insert(sym);
+                }
+            }
+        }
+        self.indexed_rules = rules.len();
+        self.seed_rules_len = rules.len();
     }
 
     /// Resets `pair_map` in-place (retaining allocated bucket capacity so zero reallocations occur)
@@ -277,6 +297,7 @@ impl RuleInterner {
         });
         self.run_map.insert((base_child, total_count), sym);
         self.indexed_rules = rules.len();
+        self.seed_rules_len = rules.len();
         sym
     }
 
@@ -316,6 +337,7 @@ impl RuleInterner {
         });
         self.pair_map.insert(key, sym);
         self.indexed_rules = rules.len();
+        self.seed_rules_len = rules.len();
         sym
     }
 

@@ -10,8 +10,8 @@ use rayon::prelude::*;
 
 use crate::error::{ButtlickError, Result};
 use crate::format::header::{
-    BtlkHeader, PackedRuleNode, BTLK_HEADER_SIZE, BTLK_VERSION_V1, FLAG_LINE_ANCHORED_LCP,
-    PACKED_RULE_SIZE,
+    BtlkHeader, PackedRuleNode, BTLK_HEADER_SIZE, BTLK_VERSION_V1, FLAG_EXACT_ROOT_HASHES,
+    FLAG_LINE_ANCHORED_LCP, PACKED_RULE_SIZE,
 };
 use crate::grammar::{find_root_in, GrammarDag, RootEntry, RuleKind, RuleNode, SymbolId};
 use crate::hash::checksum64;
@@ -88,6 +88,7 @@ impl<W: Write> ChecksumWriter<W> {
 
 /// Validated byte layout of a `.btlk` v1 archive (header + parsed root table + rule table bounds).
 struct BtlkLayout {
+    exact_root_hashes: bool,
     roots: Vec<RootEntry>,
     rules_offset: usize,
     rules_end: usize,
@@ -106,6 +107,11 @@ impl BtlkLayout {
         }
 
         let header = BtlkHeader::from_bytes(&bytes[0..BTLK_HEADER_SIZE])?;
+        if header.num_rules > (1u64 << 31) - 256 {
+            return Err(ButtlickError::CorruptedFormat(
+                "Rule table exceeds the 31-bit symbol limit".into(),
+            ));
+        }
         let payload_end = bytes.len() - 8;
         let roots_offset = header.roots_offset as usize;
         let rules_offset = header.rules_offset as usize;
@@ -128,12 +134,13 @@ impl BtlkLayout {
         }
 
         // Symbols must reference either a terminal byte or an existing rule.
-        let max_sym = SymbolId::from_rule_index(num_rules).0 as u64;
+        let max_sym = num_rules as u64 + 256;
         let mut cursor = roots_offset;
         // Each root entry occupies at least 32 bytes, so cap the reservation by the section size
         // to avoid huge allocations from a corrupted `num_roots` field.
         let max_roots = (rules_offset - roots_offset) / 32;
         let mut roots = Vec::with_capacity((header.num_roots as usize).min(max_roots));
+        let mut total_bytes = 0u64;
         for _ in 0..header.num_roots {
             if cursor + 32 > rules_offset {
                 return Err(ButtlickError::CorruptedFormat(
@@ -146,6 +153,14 @@ impl BtlkLayout {
             let sym_raw = u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap());
             let byte_len = u64::from_le_bytes(bytes[cursor + 16..cursor + 24].try_into().unwrap());
             let kr_hash = u64::from_le_bytes(bytes[cursor + 24..cursor + 32].try_into().unwrap());
+            total_bytes = total_bytes.checked_add(byte_len).ok_or_else(|| {
+                ButtlickError::CorruptedFormat("Total uncompressed size exceeds u64".into())
+            })?;
+            if has_symbol > 1 || (has_symbol == 0) != (byte_len == 0) {
+                return Err(ButtlickError::CorruptedFormat(
+                    "Invalid root presence/length metadata".into(),
+                ));
+            }
             cursor += 32;
 
             if name_len > rules_offset - cursor {
@@ -178,7 +193,13 @@ impl BtlkLayout {
             });
         }
 
+        if total_bytes != header.total_uncompressed_bytes {
+            return Err(ButtlickError::CorruptedFormat(
+                "Header total size differs from root table".into(),
+            ));
+        }
         Ok(Self {
+            exact_root_hashes: header.flags & FLAG_EXACT_ROOT_HASHES != 0,
             roots,
             rules_offset,
             rules_end: expected_rules_end,
@@ -194,7 +215,12 @@ impl GrammarDag {
         let payload_size = (rules_offset as usize) + self.rules.len() * PACKED_RULE_SIZE;
         let header = BtlkHeader {
             version: BTLK_VERSION_V1,
-            flags: FLAG_LINE_ANCHORED_LCP,
+            flags: FLAG_LINE_ANCHORED_LCP
+                | if self.root_hashes_are_exact() {
+                    FLAG_EXACT_ROOT_HASHES
+                } else {
+                    0
+                },
             num_roots: self.roots.len() as u64,
             num_rules: self.rules.len() as u64,
             roots_offset,
@@ -252,6 +278,25 @@ impl GrammarDag {
 
     /// Serializes the archive (header, root table, packed rule table, footer checksum) into `inner`.
     fn write_btlk<W: Write>(&self, inner: W) -> std::io::Result<W> {
+        if self
+            .roots
+            .iter()
+            .try_fold(0u64, |sum, root| sum.checked_add(root.byte_len))
+            .is_none()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "total uncompressed size exceeds the .btlk u64 limit",
+            ));
+        }
+        if self.rules.len() > (1usize << 31) - 256
+            || self.roots.iter().any(|r| r.name.len() > u32::MAX as usize)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive exceeds .btlk format limits",
+            ));
+        }
         let roots_buf = self.encode_roots_section();
         let (header, payload_size) = self.btlk_header(roots_buf.len());
 
@@ -263,21 +308,22 @@ impl GrammarDag {
         for rules_batch in self.rules.chunks(BATCH_RULES) {
             let byte_len = rules_batch.len() * PACKED_RULE_SIZE;
             let dst_slice = &mut chunk_buf[..byte_len];
-            let pack = |dst_chunk: &mut [u8], node_chunk: &[RuleNode]| {
+            let pack = |dst_chunk: &mut [u8], node_chunk: &[RuleNode]| -> std::io::Result<()> {
                 for (dst, node) in dst_chunk
                     .chunks_exact_mut(PACKED_RULE_SIZE)
                     .zip(node_chunk.iter())
                 {
-                    dst.copy_from_slice(&PackedRuleNode::from_rule_node(node).to_bytes());
+                    dst.copy_from_slice(&PackedRuleNode::from_rule_node(node)?.to_bytes());
                 }
+                Ok(())
             };
             if rules_batch.len() >= 16_384 {
                 dst_slice
                     .par_chunks_mut(4096 * PACKED_RULE_SIZE)
                     .zip(rules_batch.par_chunks(4096))
-                    .for_each(|(dst_chunk, node_chunk)| pack(dst_chunk, node_chunk));
+                    .try_for_each(|(dst_chunk, node_chunk)| pack(dst_chunk, node_chunk))?;
             } else {
-                pack(dst_slice, rules_batch);
+                pack(dst_slice, rules_batch)?;
             }
             writer.write_payload(dst_slice)?;
         }
@@ -309,6 +355,7 @@ impl GrammarDag {
         }
 
         let BtlkLayout {
+            exact_root_hashes,
             roots,
             rules_offset,
             rules_end: expected_rules_end,
@@ -379,7 +426,9 @@ impl GrammarDag {
             });
         }
 
-        Ok(Self::from_parts(rules, roots))
+        let mut dag = Self::from_parts(rules, roots);
+        dag.root_hashes_are_fingerprints = !exact_root_hashes;
+        Ok(dag)
     }
 
     /// Loads a `GrammarDag` from a `.btlk` file on disk using `memmap2::Mmap` for zero-copy OS page mapping.
@@ -393,6 +442,7 @@ impl GrammarDag {
 /// Zero-copy memory-mapped `.btlk` archive view that evaluates queries directly on the on-disk
 /// 8-byte `PackedRuleNode` array without allocating `Vec<RuleNode>`.
 pub struct MappedArchive {
+    exact_root_hashes: bool,
     mmap: Mmap,
     pub roots: Vec<RootEntry>,
     rules_offset: usize,
@@ -410,6 +460,7 @@ impl MappedArchive {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let BtlkLayout {
+            exact_root_hashes,
             roots,
             rules_offset,
             rules_end,
@@ -417,6 +468,7 @@ impl MappedArchive {
         } = BtlkLayout::parse(&mmap)?;
 
         Ok(Self {
+            exact_root_hashes,
             mmap,
             roots,
             rules_offset,
@@ -432,6 +484,11 @@ impl MappedArchive {
 
     pub fn find_root(&self, doc_name: Option<&str>) -> Result<&RootEntry> {
         find_root_in(&self.roots, doc_name)
+    }
+
+    /// Whether the writer guarantees polynomial Karp-Rabin hashes for every root.
+    pub fn root_hashes_are_exact(&self) -> bool {
+        self.exact_root_hashes
     }
 
     /// Fully decodes the archive into an in-memory `GrammarDag` (verifying the footer checksum).

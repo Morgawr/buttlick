@@ -22,10 +22,20 @@ fn brute_replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec
 
 #[test]
 fn test_100_sequential_random_dag_edits_vs_vec_oracle() {
+    for multi_document in [false, true] {
+        sequential_edits(multi_document);
+    }
+}
+
+fn sequential_edits(multi_document: bool) {
     let mut rng = StdRng::seed_from_u64(0xED17_F00D);
 
     let mut raw: Vec<u8> = b"INIT_BLOCK_AAAABBBB\n".repeat(40);
     let mut dag = GrammarDag::from_bytes(&raw);
+    let sentinel = b"INIT_BLOCK_AAAABBBB\nuntouched other document\n".repeat(10);
+    if multi_document {
+        dag.add_document("sentinel", &sentinel);
+    }
     dag.validate_invariants().unwrap();
 
     let tokens = [
@@ -91,6 +101,11 @@ fn test_100_sequential_random_dag_edits_vs_vec_oracle() {
         }
 
         // After EVERY single edit operation:
+        if multi_document && step % 7 == 0 {
+            dag.compact();
+            dag = GrammarDag::from_btlk_bytes(&dag.to_btlk_bytes()).unwrap();
+            assert_eq!(dag.decompress(Some("sentinel")).unwrap(), sentinel);
+        }
         // 1. Structural and topological invariants must hold
         dag.validate_invariants().unwrap();
 

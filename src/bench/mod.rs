@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::engine::aggregate::{eval_single_line, AggregateQuery, AggregateSummary};
 use crate::engine::kmp_seam::{build_kmp_table, kmp_count};
 use crate::engine::regex_compile::GrepMode;
+use crate::format::MappedArchive;
 use crate::grammar::GrammarDag;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -197,6 +198,44 @@ pub fn run_benchmarks(size_mb: usize) -> BenchReport {
         raw_scan_us: raw_agg_us.max(1),
         speedup_x: (raw_agg_us.max(1) as f64) / (bt_agg_us.max(1) as f64),
         verified_result: format!("count={}, sum={}", bt_agg.count, bt_agg.sum),
+    });
+
+    // Exercise the same memory-mapped APIs used by the CLI. Each operation creates its
+    // own evaluator/caches, as a fresh CLI command would; serialization is outside timing.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    dag.save_to_path(file.path()).unwrap();
+    let mapped = MappedArchive::open(file.path()).unwrap();
+    let mut measure = |operation: &str, raw_us: u64, f: &mut dyn FnMut() -> String| {
+        let start = Instant::now();
+        let verified_result = f();
+        let elapsed = (start.elapsed().as_micros() as u64).max(1);
+        benchmarks.push(OperationBench {
+            operation: format!("Mapped {operation}"),
+            buttlick_us: elapsed,
+            raw_scan_us: raw_us.max(1),
+            speedup_x: raw_us.max(1) as f64 / elapsed as f64,
+            verified_result,
+        });
+    };
+    measure("Exact Substring Count ('ERROR')", raw_count_us, &mut || {
+        let count = mapped.count_literal(None, pattern).unwrap();
+        assert_eq!(count, raw_count);
+        format!("count={count}")
+    });
+    measure("Substring Equality", raw_eq_us, &mut || {
+        let equal = mapped.substring_eq(None, 0, pos2, span).unwrap();
+        assert_eq!(equal, raw_eq);
+        format!("equal={equal}")
+    });
+    measure("Regex Line Grep", raw_grep_us, &mut || {
+        let count = mapped.grep(None, regex_pat, GrepMode::LineCount).unwrap();
+        assert_eq!(count, raw_grep);
+        format!("lines={count}")
+    });
+    measure("Structured Analytics", raw_agg_us, &mut || {
+        let summary = mapped.aggregate_query(None, &agg_query).unwrap();
+        assert_eq!(summary, raw_agg);
+        format!("count={}, sum={}", summary.count, summary.sum)
     });
 
     BenchReport {

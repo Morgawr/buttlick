@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use memmap2::Mmap;
 use rayon::prelude::*;
 
 use buttlick::bench::run_benchmarks;
@@ -16,6 +17,22 @@ const BINARY_MEDIA_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "mp3", "ogg", "wav", "flac", "mp4", "mkv",
     "avi", "mov", "zip", "gz", "xz", "zst", "7z", "rar", "tar", "iso", "bin", "btlk",
 ];
+
+/// Empty files have no mapping; nonempty inputs are paged in as compression visits them.
+struct MappedInput(Option<Mmap>);
+
+impl AsRef<[u8]> for MappedInput {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+}
+
+#[derive(Default)]
+struct SkippedInputs {
+    symlinks: usize,
+    empty_dirs: usize,
+    special_files: usize,
+}
 
 fn should_include_file(path: &Path, text_only: bool, exclude_exts: &[String]) -> bool {
     let ext = path
@@ -41,29 +58,58 @@ fn collect_input_files(
     inputs: &[PathBuf],
     text_only: bool,
     exclude_exts: &[String],
+    skipped: &mut SkippedInputs,
 ) -> Result<Vec<(String, PathBuf, u64)>> {
     let mut raw_paths: Vec<(String, PathBuf)> = Vec::new();
     for input in inputs {
-        if input.is_dir() {
+        // An explicitly named input follows symlinks; recursive traversal below skips them.
+        let ft = fs::metadata(input)
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("cannot inspect '{}': {err}", input.display()),
+                )
+            })?
+            .file_type();
+        if ft.is_dir() {
             let base = input.parent().unwrap_or_else(|| Path::new(""));
-            collect_dir_recursive(base, input, text_only, exclude_exts, &mut raw_paths)?;
-        } else if should_include_file(input, text_only, exclude_exts) {
+            collect_dir_recursive(
+                base,
+                input,
+                text_only,
+                exclude_exts,
+                &mut raw_paths,
+                skipped,
+            )?;
+        } else if ft.is_file() && should_include_file(input, text_only, exclude_exts) {
             let name = input
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| input.to_string_lossy().into_owned());
             raw_paths.push((name, input.clone()));
+        } else if !ft.is_file() {
+            skipped.special_files += 1;
         }
     }
     raw_paths.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let out: Vec<(String, PathBuf, u64)> = raw_paths
+    for pair in raw_paths.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(ButtlickError::InvalidQuery(format!(
+                "Duplicate archive document name '{}': '{}' and '{}'",
+                pair[0].0,
+                pair[0].1.display(),
+                pair[1].1.display()
+            )));
+        }
+    }
+    let out: Result<Vec<(String, PathBuf, u64)>> = raw_paths
         .into_par_iter()
         .map(|(name, path)| {
-            let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            (name, path, len)
+            let len = fs::metadata(&path)?.len();
+            Ok((name, path, len))
         })
         .collect();
-    Ok(out)
+    out
 }
 
 fn collect_dir_recursive(
@@ -72,20 +118,28 @@ fn collect_dir_recursive(
     text_only: bool,
     exclude_exts: &[String],
     out: &mut Vec<(String, PathBuf)>,
+    skipped: &mut SkippedInputs,
 ) -> Result<()> {
+    let mut empty = true;
     for entry in fs::read_dir(dir)? {
+        empty = false;
         let entry = entry?;
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
+        let ft = entry.file_type()?;
         let path = entry.path();
         if ft.is_dir() {
-            collect_dir_recursive(base, &path, text_only, exclude_exts, out)?;
+            collect_dir_recursive(base, &path, text_only, exclude_exts, out, skipped)?;
         } else if ft.is_file() && should_include_file(&path, text_only, exclude_exts) {
             let rel = path.strip_prefix(base).unwrap_or(&path);
             let name = rel.to_string_lossy().replace('\\', "/");
             out.push((name, path));
+        } else if ft.is_symlink() {
+            skipped.symlinks += 1;
+        } else if !ft.is_file() {
+            skipped.special_files += 1;
         }
+    }
+    if empty {
+        skipped.empty_dirs += 1;
     }
     Ok(())
 }
@@ -146,6 +200,16 @@ enum Commands {
         json: bool,
     },
 
+    /// Verify the whole-file checksum without decompressing
+    Verify { input: PathBuf },
+
+    /// Remove grammar rules unreachable from all documents
+    Compact {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
     /// O(log N) random-access byte slice extraction without decompressing the file
     Slice {
         /// Input .btlk archive path
@@ -195,7 +259,7 @@ enum Commands {
         #[arg(long)]
         doc: Option<String>,
         /// Query across all documents in the archive in a single shared-DAG pass
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["offsets", "doc"])]
         all: bool,
     },
 
@@ -212,16 +276,16 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         limit: usize,
         /// Count matching lines (`grep -E -c` semantics, default when `--lines` is not set)
-        #[arg(short = 'c', long)]
+        #[arg(short = 'c', long, conflicts_with_all = ["match_count", "lines"])]
         line_count: bool,
         /// Count total non-overlapping regex matches across the stream
-        #[arg(long)]
+        #[arg(long, conflicts_with = "lines")]
         match_count: bool,
         /// Optional document name
         #[arg(long)]
         doc: Option<String>,
         /// Query across all documents in the archive in a single shared-DAG pass
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long, conflicts_with = "doc")]
         all: bool,
         /// Colorize matched strings and filenames (`auto`, `always`, `never`)
         #[arg(
@@ -269,6 +333,9 @@ enum Commands {
         /// Optional document name to edit (for insert, delete, replace)
         #[arg(long)]
         doc: Option<String>,
+        /// Remove unreachable rules before writing the edited archive
+        #[arg(long)]
+        compact: bool,
         #[command(subcommand)]
         action: EditAction,
     },
@@ -407,7 +474,14 @@ fn run() -> Result<()> {
             exclude_ext,
             stats,
         } => {
-            let file_list = collect_input_files(&inputs, text_only, &exclude_ext)?;
+            let mut skipped = SkippedInputs::default();
+            let file_list = collect_input_files(&inputs, text_only, &exclude_ext, &mut skipped)?;
+            if stats && (skipped.symlinks + skipped.empty_dirs + skipped.special_files > 0) {
+                eprintln!(
+                    "[buttlick] Skipped {} symbolic links, {} empty directories, {} special files",
+                    skipped.symlinks, skipped.empty_dirs, skipped.special_files
+                );
+            }
             let total_files = file_list.len();
             let total_bytes: u64 = file_list.iter().map(|(_, _, sz)| *sz).sum();
 
@@ -447,12 +521,24 @@ fn run() -> Result<()> {
                 }
                 let slice = &file_list[batch_start..idx];
 
-                // Read all files in the current 64 MB batch in parallel across worker threads
-                let loaded_batch: Result<Vec<(String, Vec<u8>)>> = slice
+                // Map inputs instead of allocating a whole-file buffer (a single input can
+                // exceed the batch budget). Empty files cannot be mmap'ed.
+                let loaded_batch: Result<Vec<(String, MappedInput)>> = slice
                     .par_iter()
                     .map(|(name, path, _)| {
-                        let bytes = fs::read(path)?;
-                        Ok((name.clone(), bytes))
+                        let file = fs::File::open(path).map_err(|err| {
+                            io::Error::new(
+                                err.kind(),
+                                format!("cannot read '{}': {err}", path.display()),
+                            )
+                        })?;
+                        let bytes = if file.metadata()?.len() == 0 {
+                            None
+                        } else {
+                            // Inputs, like mapped archives, must not be modified while in use.
+                            Some(unsafe { Mmap::map(&file)? })
+                        };
+                        Ok((name.clone(), MappedInput(bytes)))
                     })
                     .collect();
                 let loaded_batch = loaded_batch?;
@@ -498,6 +584,8 @@ fn run() -> Result<()> {
                     dag.max_height()
                 );
             }
+            // This one-shot CLI exits immediately; avoid walking gigabytes of allocations
+            // just to return them to the OS. Library callers retain normal RAII cleanup.
             std::mem::forget(dag);
         }
 
@@ -567,11 +655,31 @@ fn run() -> Result<()> {
                 println!("  Max DAG Height     : {}", rep.max_height);
                 for r in &rep.roots {
                     println!(
-                        "  - Root '{}' : {} bytes, height {}, hash {}",
-                        r.name, r.byte_len, r.height, r.kr_hash_hex
+                        "  - Root '{}' : {} bytes, height {}, {} {}",
+                        r.name,
+                        r.byte_len,
+                        r.height,
+                        if rep.root_hashes_exact {
+                            "hash"
+                        } else {
+                            "fingerprint"
+                        },
+                        r.kr_hash_hex
                     );
                 }
             }
+        }
+
+        Commands::Verify { input } => {
+            MappedArchive::open(input)?.verify_checksum()?;
+            println!("Checksum OK");
+        }
+
+        Commands::Compact { input, output } => {
+            let mut dag = GrammarDag::load_from_path(input)?;
+            let removed = dag.compact();
+            dag.save_to_path(output)?;
+            println!("Removed {removed} unreachable rules");
         }
 
         Commands::Slice {
@@ -746,13 +854,23 @@ fn run() -> Result<()> {
             };
             let res = archive.aggregate_query(doc.as_deref(), &q)?;
             if json {
-                let payload = serde_json::json!({
-                    "count": res.count,
-                    "sum": res.sum,
-                    "min": res.min,
-                    "max": res.max,
-                    "avg": res.avg(),
-                });
+                // Serialize i128 directly: json! first builds a Value, whose integer
+                // representation is limited to 64 bits and panics on a valid larger sum.
+                #[derive(serde::Serialize)]
+                struct QueryOutput {
+                    count: u64,
+                    sum: i128,
+                    min: Option<i64>,
+                    max: Option<i64>,
+                    avg: Option<f64>,
+                }
+                let payload = QueryOutput {
+                    count: res.count,
+                    sum: res.sum,
+                    min: res.min,
+                    max: res.max,
+                    avg: res.avg(),
+                };
                 println!("{}", serde_json::to_string_pretty(&payload).unwrap());
             } else {
                 println!("COUNT : {}", res.count);
@@ -782,9 +900,16 @@ fn run() -> Result<()> {
             input,
             output,
             doc,
+            compact,
             action,
         } => {
             let mut dag = GrammarDag::load_from_path(&input)?;
+            if dag.roots.len() > 1 && doc.is_none() && !matches!(action, EditAction::Concat { .. })
+            {
+                return Err(ButtlickError::InvalidQuery(
+                    "editing a multi-document archive requires --doc".into(),
+                ));
+            }
             match action {
                 EditAction::Insert { offset, text } => {
                     dag.insert(doc.as_deref(), offset, text.as_bytes())?;
@@ -802,6 +927,9 @@ fn run() -> Result<()> {
                 } => {
                     let _ = dag.concat_documents(&doc1, &doc2, new_name)?;
                 }
+            }
+            if compact {
+                dag.compact();
             }
             dag.save_to_path(&output)?;
         }

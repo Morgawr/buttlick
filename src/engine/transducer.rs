@@ -1,8 +1,53 @@
 use crate::grammar::{GrammarDag, RuleKind, SymbolId};
 
+/// Applies a deterministic state transition repeatedly, skipping complete cycles. Most runs
+/// reach a fixed point immediately, so allocate the cycle table only after eight transitions.
+pub(crate) fn advance_run(
+    count: u64,
+    q: u16,
+    num_states: usize,
+    mut step: impl FnMut(u16) -> (u16, u64),
+) -> (u16, u64) {
+    let (mut q, mut i, mut total) = (q, 0u64, 0u64);
+    let mut seen = Vec::new();
+    while i < count {
+        if i == 8 {
+            seen.resize(num_states, (u64::MAX, 0u64));
+        }
+        if !seen.is_empty() {
+            let (prev_i, prev_total) = seen[q as usize];
+            if prev_i != u64::MAX {
+                let cycles = (count - i) / (i - prev_i);
+                if cycles > 0 {
+                    total = total.saturating_add((total - prev_total).saturating_mul(cycles));
+                    i += cycles * (i - prev_i);
+                    if i == count {
+                        break;
+                    }
+                }
+                // Only a partial cycle remains; no further cycle bookkeeping is necessary.
+                seen.clear();
+            } else {
+                seen[q as usize] = (i, total);
+            }
+        }
+        let (next, emitted) = step(q);
+        if next == q {
+            total = total.saturating_add(emitted.saturating_mul(count - i));
+            break;
+        }
+        total = total.saturating_add(emitted);
+        q = next;
+        i += 1;
+    }
+    (q, total)
+}
+
 /// A Deterministic Finite-State Mealy Transducer over the byte alphabet `0..=255`.
 /// Evaluates regular expressions and stateful stream queries homomorphically on the `GrammarDag`
 /// via the Wreath-Product Monoid without decompressing the data.
+/// Emission totals saturate at `u64::MAX`; ordinary unit-weight byte/regex counts
+/// remain exact whenever the final total (including EOF) fits in `u64`.
 #[derive(Clone, Debug)]
 pub struct MealyTransducer {
     pub num_states: usize,
@@ -27,8 +72,12 @@ pub struct NodeTransducerSummary {
 impl NodeTransducerSummary {
     #[inline]
     pub fn identity(num_states: usize) -> Self {
+        assert!(
+            num_states <= u16::MAX as usize + 1,
+            "transducer exceeds u16 states"
+        );
         Self {
-            next_state: (0..num_states as u16).collect(),
+            next_state: (0..num_states).map(|q| q as u16).collect(),
             emit_sum: vec![0u64; num_states],
         }
     }
@@ -56,7 +105,7 @@ pub fn compose_summaries(
     for q in 0..s {
         let mid = left.next_state[q] as usize;
         out.next_state[q] = right.next_state[mid];
-        out.emit_sum[q] = left.emit_sum[q] + right.emit_sum[mid];
+        out.emit_sum[q] = left.emit_sum[q].saturating_add(right.emit_sum[mid]);
     }
 }
 
@@ -222,7 +271,8 @@ impl MealyTransducer {
                         (true, true) => {
                             for q in 0..s {
                                 let mid = scratch_a.next_state[q] as usize;
-                                scratch_a.emit_sum[q] += scratch_b.emit_sum[mid];
+                                scratch_a.emit_sum[q] =
+                                    scratch_a.emit_sum[q].saturating_add(scratch_b.emit_sum[mid]);
                             }
                             let pool_idx = (emit_pool.len() / s) as u32;
                             emit_pool.extend_from_slice(&scratch_a.emit_sum);
@@ -316,15 +366,15 @@ impl TransducerDagEval {
         }
     }
 
-    /// Returns the total weight emitted for `root_symbol` (or `0` if `None` / empty document).
+    /// Returns the total weight, including EOF. An empty document emits EOF from the start state.
     #[inline]
     pub fn query_root(&self, root_symbol: Option<SymbolId>) -> u64 {
         let Some(sym) = root_symbol else {
-            return 0;
+            return self.eof_emit[self.start_state as usize];
         };
         let q0 = self.start_state;
         let final_q = self.next_state_at(sym, q0) as usize;
-        self.emit_at(sym, q0) + self.eof_emit[final_q]
+        self.emit_at(sym, q0).saturating_add(self.eof_emit[final_q])
     }
 
     /// Collects the exact byte offsets where transitions emit weight `> 0` (e.g. terminating `\n`
@@ -381,22 +431,116 @@ impl TransducerDagEval {
                 q_out
             }
             RuleKind::Run { child, count } => {
-                let c_len = dag.sym_len(child);
-                let mut cur_q = q;
-                let mut cur_off = base_offset;
-                for _ in 0..count {
-                    if out.len() >= limit {
-                        break;
-                    }
-                    let next_q = self.next_state_at(child, cur_q);
-                    if self.emit_at(child, cur_q) == 0 && next_q == cur_q {
-                        break;
-                    }
-                    cur_q = self.walk_emitted_offsets(dag, child, cur_q, cur_off, limit, out);
-                    cur_off += c_len;
-                }
+                self.walk_run_offsets(dag, child, count, q, base_offset, limit, out);
                 q_out
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_run_offsets(
+        &self,
+        dag: &GrammarDag,
+        child: SymbolId,
+        count: u64,
+        q: u16,
+        base: u64,
+        limit: usize,
+        out: &mut Vec<u64>,
+    ) -> u16 {
+        if count == 1 {
+            return self.walk_emitted_offsets(dag, child, q, base, limit, out);
+        }
+        let (end, emitted) = advance_run(count, q, self.num_states, |state| {
+            (self.next_state_at(child, state), self.emit_at(child, state))
+        });
+        if emitted > 0 && out.len() < limit {
+            let left_count = count / 2;
+            let mid = self.walk_run_offsets(dag, child, left_count, q, base, limit, out);
+            if out.len() < limit {
+                self.walk_run_offsets(
+                    dag,
+                    child,
+                    count - left_count,
+                    mid,
+                    base + dag.sym_len(child) * left_count,
+                    limit,
+                    out,
+                );
+            }
+        }
+        end
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycles_match_direct_evaluation() {
+        for states in [2usize, 3, 13] {
+            for count in [0, 1, 8, 9, 37, 1000] {
+                let got = advance_run(count, 0, states, |q| {
+                    (((q as usize + 1) % states) as u16, q as u64)
+                });
+                let mut expected = (0, 0);
+                for _ in 0..count {
+                    expected.1 += expected.0 as u64;
+                    expected.0 = ((expected.0 as usize + 1) % states) as u16;
+                }
+                assert_eq!(got, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_supports_all_u16_states() {
+        let identity = NodeTransducerSummary::identity(65536);
+        assert_eq!(identity.next_state.len(), 65536);
+        assert_eq!(identity.next_state[65535], u16::MAX);
+        assert!(identity.emit_sum.iter().all(|&n| n == 0));
+    }
+
+    #[test]
+    fn large_weights_saturate_without_losing_emission_offsets() {
+        let mut dag = GrammarDag::new();
+        let run = dag.intern_run(SymbolId::from_byte(b'a'), 2);
+        let root = dag.intern_pair(run, SymbolId::from_byte(b'b'));
+        let transducer = MealyTransducer {
+            num_states: 1,
+            start_state: 0,
+            byte_next: vec![0; 256],
+            byte_emit: vec![u64::MAX; 256],
+            eof_emit: vec![1],
+        };
+        let eval = transducer.evaluate_dag(&dag);
+        assert_eq!(eval.query_root(None), 1);
+        assert_eq!(eval.query_root(Some(root)), u64::MAX);
+        let mut offsets = Vec::new();
+        eval.collect_emitted_offsets(&dag, root, 10, &mut offsets);
+        assert_eq!(offsets, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn offset_walk_skips_nonemitting_cycle_after_a_match() {
+        let mut dag = GrammarDag::new();
+        let root = dag.intern_run(SymbolId::from_byte(b'a'), 3_000_000_000);
+        let mut transducer = MealyTransducer {
+            num_states: 3,
+            start_state: 0,
+            byte_next: vec![0; 3 * 256],
+            byte_emit: vec![0; 3 * 256],
+            eof_emit: vec![0; 3],
+        };
+        transducer.byte_next[b'a' as usize] = 1;
+        transducer.byte_emit[b'a' as usize] = 1;
+        transducer.byte_next[256 + b'a' as usize] = 2;
+        transducer.byte_next[512 + b'a' as usize] = 1;
+        let eval = transducer.evaluate_dag(&dag);
+        assert_eq!(eval.query_root(Some(root)), 1);
+        let mut offsets = Vec::new();
+        eval.collect_emitted_offsets(&dag, root, 10, &mut offsets);
+        assert_eq!(offsets, [0]);
     }
 }

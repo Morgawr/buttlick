@@ -10,7 +10,12 @@ pub const BTLK_HEADER_SIZE: usize = 64;
 /// in a single linear topological pass on load.
 pub const PACKED_RULE_SIZE: usize = 8;
 
+/// Advisory producer-algorithm marker. Decoding/query semantics depend only on the rule
+/// table, so readers do not require line-anchored parsing and can safely ignore this bit.
 pub const FLAG_LINE_ANCHORED_LCP: u64 = 1 << 0;
+/// All root hashes are exact polynomial Karp-Rabin hashes. Older writers used a
+/// line fingerprint for large batches, so unflagged archives cannot promise this.
+pub const FLAG_EXACT_ROOT_HASHES: u64 = 1 << 1;
 
 /// 64-byte fixed file header for `.btlk` v1 archives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,23 +101,33 @@ impl PackedRuleNode {
     pub const RUN_TAG_BIT: u32 = 0x8000_0000;
 
     #[inline(always)]
-    pub fn from_rule_node(node: &RuleNode) -> Self {
-        match node.kind {
-            RuleKind::Pair { left, right } => Self {
-                word0: left.0,
-                word1: right.0,
-            },
+    pub fn from_rule_node(node: &RuleNode) -> std::io::Result<Self> {
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rule cannot be represented in the .btlk 31-bit symbol / u32 run format",
+            )
+        };
+        Ok(match node.kind {
+            RuleKind::Pair { left, right } => {
+                if left.0 >= Self::RUN_TAG_BIT || right.0 >= Self::RUN_TAG_BIT {
+                    return Err(invalid());
+                }
+                Self {
+                    word0: left.0,
+                    word1: right.0,
+                }
+            }
             RuleKind::Run { child, count } => {
-                debug_assert!(
-                    count <= u32::MAX as u64,
-                    "Run count {count} does not fit the on-disk u32 field"
-                );
+                if child.0 >= Self::RUN_TAG_BIT || !(2..=u32::MAX as u64).contains(&count) {
+                    return Err(invalid());
+                }
                 Self {
                     word0: child.0 | Self::RUN_TAG_BIT,
                     word1: count as u32,
                 }
             }
-        }
+        })
     }
 
     #[inline(always)]

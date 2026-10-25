@@ -1,0 +1,8 @@
+round0 base  corpus   10.05s     5473 MB size=1239786152 sha=a9d813db670c rc=0
+round0 base  big.c     6.47s     4434 MB size=543921200 sha=ce5d3a0c0f69 rc=0
+base big.c round trip OK
+corpus archive size change: +0.000%
+round0 new   corpus   11.51s     5473 MB size=1239786152 sha=f1544ef77a46 rc=0
+big.c archive size change: +0.000%
+round0 new   big.c     6.35s     4011 MB size=543921200 sha=1d00f8a5bb59 rc=0
+new big.c round trip OK

@@ -1,0 +1,26 @@
+Baseline revision: f896174
+Final normal release executable SHA-256:
+953687b226cb13ed268669172569a8457db5483a7383b3614231e08d5040f7bf
+
+cargo fmt --check: PASS
+cargo test: PASS (51 tests)
+cargo test --release: PASS (51 tests)
+cargo clippy --all-targets: PASS
+git diff --check: PASS
+cargo build --release: PASS
+Python AST checks for scripts/bench/*.py: PASS
+bash -n scripts/bench/setup.sh: PASS
+buttlick bench --size-mb 1 --json: PASS (8 cases, including 4 mapped cases)
+
+Final compression comparison: PASS, 0% size change on kernel and concatenated C.
+Baseline/current concatenated C streaming SHA-256 round trips: PASS.
+Freshly compressed kernel extraction: PASS, unexpected differences=0.
+Final multi-document and single-document benchmark command statuses: all zero.
+All expected query/decompression output hashes: PASS.
+Inspection output intentionally differs because hash-guarantee metadata is now reported.
+Frozen mixed fixture: PASS, 0% size change and 28/28 files round trip for both binaries.
+Final insertion benchmark: PASS, baseline/current edited bytes equal the raw-byte oracle.
+
+See the matching final-compression, final-multi, final-big, final-mixed,
+final-edits, and final-builtin files for measurements and answers.
+Benchmarks ran serially without concurrent compilation. No Android tests were run.

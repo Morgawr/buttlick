@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine::kmp_seam::KmpDagIndex;
-use crate::engine::regex_compile::{
-    compile_line_grep_transducer, compile_match_count_transducer, GrepMode,
-};
+use crate::engine::regex_compile::{compile_line_grep_transducer, GrepMode};
 use crate::error::{ButtlickError, Result};
 use crate::format::header::{PackedRuleNode, BTLK_HEADER_SIZE, PACKED_RULE_SIZE};
 use crate::format::MappedArchive;
@@ -19,6 +17,8 @@ pub struct RootReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InspectReport {
+    /// False for legacy archives whose root hash algorithm was not recorded.
+    pub root_hashes_exact: bool,
     pub num_roots: usize,
     pub num_rules: usize,
     pub num_pair_rules: usize,
@@ -47,13 +47,16 @@ fn build_inspect_report(
             height: r.root_symbol.map(&height_of).unwrap_or(0),
         })
         .collect();
-    let total_uncompressed_bytes: u64 = roots.iter().map(|r| r.byte_len).sum();
+    let total_uncompressed_bytes: u64 = roots
+        .iter()
+        .fold(0, |sum: u64, root| sum.saturating_add(root.byte_len));
     let compression_ratio = if archive_bytes > 0 {
         (total_uncompressed_bytes as f64) / (archive_bytes as f64)
     } else {
         1.0
     };
     InspectReport {
+        root_hashes_exact: false,
         num_roots: roots.len(),
         num_rules,
         num_pair_rules,
@@ -109,14 +112,16 @@ impl MappedArchive {
                     .saturating_add(1)
             };
         }
-        Ok(build_inspect_report(
+        let mut report = build_inspect_report(
             &self.roots,
             |sym| height(sym, &heights),
             self.num_rules,
             num_pair_rules,
             num_run_rules,
             archive_bytes,
-        ))
+        );
+        report.root_hashes_exact = self.root_hashes_are_exact();
+        Ok(report)
     }
 }
 
@@ -140,14 +145,16 @@ impl GrammarDag {
                 as u64,
         );
 
-        build_inspect_report(
+        let mut report = build_inspect_report(
             &self.roots,
             |sym| self.sym_height(sym),
             self.rules.len(),
             num_pair_rules,
             num_run_rules,
             archive_bytes,
-        )
+        );
+        report.root_hashes_exact = self.root_hashes_are_exact();
+        report
     }
 
     /// Evaluates an exact substring count across ALL documents in the archive in a SINGLE
@@ -155,6 +162,17 @@ impl GrammarDag {
     pub fn count_literal_all_docs(&self, pattern: &[u8]) -> Result<Vec<(String, u64)>> {
         if pattern.is_empty() {
             return Err(ButtlickError::EmptyPattern);
+        }
+        if self
+            .roots
+            .iter()
+            .all(|root| root.byte_len < pattern.len() as u64)
+        {
+            return Ok(self
+                .roots
+                .iter()
+                .map(|root| (root.name.clone(), 0))
+                .collect());
         }
         let index = KmpDagIndex::evaluate(self, pattern)?;
         let mut results = Vec::with_capacity(self.roots.len());
@@ -171,10 +189,16 @@ impl GrammarDag {
     /// Evaluates a regular expression across ALL documents in the archive in a SINGLE
     /// bottom-up pass over the shared grammar rules ($O(n \cdot |Q| + M)$ for $M$ documents).
     pub fn grep_all_docs(&self, pattern: &str, mode: GrepMode) -> Result<Vec<(String, u64)>> {
-        let transducer = match mode {
-            GrepMode::LineCount => compile_line_grep_transducer(pattern)?,
-            GrepMode::MatchCount => compile_match_count_transducer(pattern)?,
-        };
+        if mode == GrepMode::MatchCount {
+            let roots: Vec<_> = self.roots.iter().collect();
+            let counts = self.match_counts(pattern, &roots)?;
+            return Ok(roots
+                .into_iter()
+                .zip(counts)
+                .map(|(root, count)| (root.name.clone(), count))
+                .collect());
+        }
+        let transducer = compile_line_grep_transducer(pattern)?;
         let eval = transducer.evaluate_dag(self);
         let mut results = Vec::with_capacity(self.roots.len());
         for root in &self.roots {

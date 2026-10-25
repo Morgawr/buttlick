@@ -1,3 +1,6 @@
+use rustc_hash::FxHashMap;
+use std::borrow::Cow;
+
 use crate::engine::transducer::MealyTransducer;
 use crate::error::{ButtlickError, Result};
 use crate::format::MappedArchive;
@@ -145,11 +148,10 @@ impl std::ops::Deref for SeamBytes {
 /// Monoid summary for a grammar symbol under the KMP Seam-Tracking Algebra.
 #[derive(Clone, Debug)]
 pub struct SeamSummary {
-    pub byte_len: u64,
     pub match_count: u64,
-    /// First `min(byte_len, m - 1)` bytes of the symbol's expansion.
+    /// First `min(symbol length, m - 1)` bytes of the symbol's expansion.
     pub prefix: SeamBytes,
-    /// Last `min(byte_len, m - 1)` bytes of the symbol's expansion.
+    /// Last `min(symbol length, m - 1)` bytes of the symbol's expansion.
     pub suffix: SeamBytes,
 }
 
@@ -160,7 +162,6 @@ impl SeamSummary {
         let w = m - 1;
         let v = SeamBytes::from_single(b, w);
         Self {
-            byte_len: 1,
             match_count,
             prefix: v.clone(),
             suffix: v,
@@ -184,14 +185,14 @@ pub fn combine_seam(
     let cross_matches = kmp_count(seam_scratch, pattern, pi);
     let match_count = left.match_count + right.match_count + cross_matches;
 
-    let mut prefix = SeamBytes::with_capacity(w);
+    let mut prefix = SeamBytes::with_capacity(w.min(left.prefix.len() + right.prefix.len()));
     prefix.extend_from_slice(&left.prefix);
     if prefix.len() < w {
         let needed = (w - prefix.len()).min(right.prefix.len());
         prefix.extend_from_slice(&right.prefix[..needed]);
     }
 
-    let mut suffix = SeamBytes::with_capacity(w);
+    let mut suffix = SeamBytes::with_capacity(w.min(left.suffix.len() + right.suffix.len()));
     if right.suffix.len() < w {
         let needed = (w - right.suffix.len()).min(left.suffix.len());
         let start = left.suffix.len() - needed;
@@ -200,14 +201,14 @@ pub fn combine_seam(
     suffix.extend_from_slice(&right.suffix);
 
     SeamSummary {
-        byte_len: left.byte_len + right.byte_len,
         match_count,
         prefix,
         suffix,
     }
 }
 
-/// Computes `base^k` in the KMP Seam-Tracking Monoid in O(m log k) time (or O(m) when `base.byte_len >= m - 1`).
+/// Computes `base^k` in the KMP Seam-Tracking Monoid in O(m log k) time (or O(m)
+/// when one copy of the child covers the prefix/suffix window).
 pub fn power_seam(
     base: &SeamSummary,
     mut k: u64,
@@ -222,20 +223,19 @@ pub fn power_seam(
     let w = pattern.len() - 1;
     // Fast path when a single copy of `base` already covers `m - 1` bytes:
     // Every seam between adjacent copies is identical, and no match can span >= 3 copies.
-    if base.byte_len >= w as u64 {
+    if base.prefix.len() == w {
         seam_scratch.clear();
         seam_scratch.extend_from_slice(&base.suffix);
         seam_scratch.extend_from_slice(&base.prefix);
         let seam_matches = kmp_count(seam_scratch, pattern, pi);
         return SeamSummary {
-            byte_len: base.byte_len * k,
             match_count: k * base.match_count + (k - 1) * seam_matches,
             prefix: base.prefix.clone(),
             suffix: base.suffix.clone(),
         };
     }
 
-    // General binary exponentiation for short periodic children (`base.byte_len < m - 1`)
+    // General binary exponentiation for short periodic children (length < m - 1).
     let mut acc: Option<SeamSummary> = None;
     let mut cur = base.clone();
     while k > 0 {
@@ -261,33 +261,70 @@ pub struct KmpDagIndex {
     pub single_counts: Vec<u64>,
     /// Used when pattern.len() >= 2
     pub summaries: Vec<SeamSummary>,
+    /// Sparse slots when evaluating a single document in a shared archive.
+    slots: Option<FxHashMap<usize, usize>>,
 }
 
 impl KmpDagIndex {
     /// Evaluates the KMP Seam-Tracking Monoid bottom-up across all rules in `dag` in O(n * |P|) time.
     pub fn evaluate(dag: &GrammarDag, pattern: &[u8]) -> Result<Self> {
+        Self::evaluate_selected(dag, pattern, None)
+    }
+
+    /// Evaluates only rules reachable from one document, storing summaries densely by slot.
+    pub fn evaluate_root(dag: &GrammarDag, pattern: &[u8], root: SymbolId) -> Result<Self> {
+        let selected = if dag.roots.len() > 1 {
+            Some(dag.reachable_rules([root]))
+        } else {
+            None
+        };
+        Self::evaluate_selected(dag, pattern, selected)
+    }
+
+    fn evaluate_selected(
+        dag: &GrammarDag,
+        pattern: &[u8],
+        selected: Option<Vec<usize>>,
+    ) -> Result<Self> {
         if pattern.is_empty() {
             return Err(ButtlickError::EmptyPattern);
         }
         let m = pattern.len();
         let pi = build_kmp_table(pattern);
+        let len = selected.as_ref().map_or(dag.rules.len(), Vec::len);
+        let slots: Option<FxHashMap<usize, usize>> = selected.as_ref().map(|indices| {
+            indices
+                .iter()
+                .enumerate()
+                .map(|(slot, &idx)| (idx, slot))
+                .collect()
+        });
+        let slot_of = |sym: SymbolId| {
+            slots
+                .as_ref()
+                .map_or(sym.rule_index(), |slots| slots[&sym.rule_index()])
+        };
+        let idx_at = |pos: usize| selected.as_ref().map_or(pos, |indices| indices[pos]);
 
         if m == 1 {
             let target = pattern[0];
-            let mut single_counts = vec![0u64; dag.rules.len()];
+            let mut single_counts = vec![0u64; len];
             let sym_count = |sym: SymbolId, counts: &[u64]| -> u64 {
                 if let Some(b) = sym.as_byte() {
                     (b == target) as u64
                 } else {
-                    counts[sym.rule_index()]
+                    counts[slot_of(sym)]
                 }
             };
-            for (idx, node) in dag.rules.iter().enumerate() {
+            for idx in 0..len {
+                let node = &dag.rules[idx_at(idx)];
                 single_counts[idx] = match node.kind {
                     RuleKind::Pair { left, right } => {
                         sym_count(left, &single_counts) + sym_count(right, &single_counts)
                     }
-                    RuleKind::Run { child, count } => count * sym_count(child, &single_counts),
+                    RuleKind::Run { child, count } => {
+                        count.saturating_mul(sym_count(child, &single_counts))
+                    }
                 };
             }
             return Ok(Self {
@@ -295,21 +332,15 @@ impl KmpDagIndex {
                 pi,
                 single_counts,
                 summaries: Vec::new(),
+                slots,
             });
         }
 
-        let mut summaries: Vec<SeamSummary> = Vec::with_capacity(dag.rules.len());
+        let mut summaries: Vec<SeamSummary> = Vec::with_capacity(len);
         let mut seam_scratch = Vec::with_capacity(2 * m);
 
-        let get_summary = |sym: SymbolId, table: &[SeamSummary]| -> SeamSummary {
-            if let Some(b) = sym.as_byte() {
-                SeamSummary::from_terminal(b, m)
-            } else {
-                table[sym.rule_index()].clone()
-            }
-        };
-
-        for node in &dag.rules {
+        for pos in 0..len {
+            let node = &dag.rules[idx_at(pos)];
             let sum = match node.kind {
                 RuleKind::Pair { left, right } => match (left.as_byte(), right.as_byte()) {
                     (Some(lb), Some(rb)) => {
@@ -319,22 +350,26 @@ impl KmpDagIndex {
                     }
                     (Some(lb), None) => {
                         let ls = SeamSummary::from_terminal(lb, m);
-                        let rs = &summaries[right.rule_index()];
+                        let rs = &summaries[slot_of(right)];
                         combine_seam(&ls, rs, pattern, &pi, &mut seam_scratch)
                     }
                     (None, Some(rb)) => {
-                        let ls = &summaries[left.rule_index()];
+                        let ls = &summaries[slot_of(left)];
                         let rs = SeamSummary::from_terminal(rb, m);
                         combine_seam(ls, &rs, pattern, &pi, &mut seam_scratch)
                     }
                     (None, None) => {
-                        let ls = &summaries[left.rule_index()];
-                        let rs = &summaries[right.rule_index()];
+                        let ls = &summaries[slot_of(left)];
+                        let rs = &summaries[slot_of(right)];
                         combine_seam(ls, rs, pattern, &pi, &mut seam_scratch)
                     }
                 },
                 RuleKind::Run { child, count } => {
-                    let cs = get_summary(child, &summaries);
+                    let cs = if let Some(b) = child.as_byte() {
+                        Cow::Owned(SeamSummary::from_terminal(b, m))
+                    } else {
+                        Cow::Borrowed(&summaries[slot_of(child)])
+                    };
                     power_seam(&cs, count, pattern, &pi, &mut seam_scratch)
                 }
             };
@@ -346,6 +381,7 @@ impl KmpDagIndex {
             pi,
             single_counts: Vec::new(),
             summaries,
+            slots,
         })
     }
 
@@ -356,21 +392,40 @@ impl KmpDagIndex {
             if let Some(b) = sym.as_byte() {
                 (b == self.pattern[0]) as u64
             } else {
-                self.single_counts[sym.rule_index()]
+                self.single_counts[self.slot_of(sym).expect("symbol not evaluated")]
             }
         } else if sym.is_terminal() {
             0
         } else {
-            self.summaries[sym.rule_index()].match_count
+            self.summary(sym).expect("symbol not evaluated").match_count
         }
     }
 
+    fn slot_of(&self, sym: SymbolId) -> Option<usize> {
+        if sym.is_terminal() {
+            return None;
+        }
+        let idx = sym.rule_index();
+        match &self.slots {
+            Some(slots) => slots.get(&idx).copied(),
+            None => (idx < self.single_counts.len().max(self.summaries.len())).then_some(idx),
+        }
+    }
+
+    pub(crate) fn contains(&self, sym: SymbolId) -> bool {
+        sym.is_terminal() || self.slot_of(sym).is_some()
+    }
+
+    pub(crate) fn summary(&self, sym: SymbolId) -> Option<&SeamSummary> {
+        self.slot_of(sym).and_then(|slot| self.summaries.get(slot))
+    }
+
     #[inline]
-    fn summary_of(&self, sym: SymbolId) -> SeamSummary {
+    fn summary_of(&self, sym: SymbolId) -> Cow<'_, SeamSummary> {
         if let Some(b) = sym.as_byte() {
-            SeamSummary::from_terminal(b, self.pattern.len())
+            Cow::Owned(SeamSummary::from_terminal(b, self.pattern.len()))
         } else {
-            self.summaries[sym.rule_index()].clone()
+            Cow::Borrowed(self.summary(sym).expect("symbol not evaluated"))
         }
     }
 
@@ -448,20 +503,14 @@ impl KmpDagIndex {
                 scratch.clear();
                 scratch.extend_from_slice(&l_sum.suffix);
                 scratch.extend_from_slice(&r_sum.prefix);
-                let seam_start = base_offset + l_sum.byte_len - (l_sum.suffix.len() as u64);
+                let left_len = dag.sym_len(left);
+                let seam_start = base_offset + left_len - (l_sum.suffix.len() as u64);
                 kmp_collect_offsets(scratch, &self.pattern, &self.pi, seam_start, limit, out);
                 if out.len() >= limit {
                     return;
                 }
 
-                self.collect_m_general(
-                    dag,
-                    right,
-                    base_offset + l_sum.byte_len,
-                    limit,
-                    out,
-                    scratch,
-                );
+                self.collect_m_general(dag, right, base_offset + left_len, limit, out, scratch);
             }
             RuleKind::Run { child, count } => {
                 let child_sum = self.summary_of(child);
@@ -529,7 +578,8 @@ impl KmpDagIndex {
         scratch.clear();
         scratch.extend_from_slice(&left_sum.suffix);
         scratch.extend_from_slice(&right_sum.prefix);
-        let seam_start = base_offset + left_sum.byte_len - (left_sum.suffix.len() as u64);
+        let left_len = dag.sym_len(child) * k_left;
+        let seam_start = base_offset + left_len - (left_sum.suffix.len() as u64);
         kmp_collect_offsets(scratch, &self.pattern, &self.pi, seam_start, limit, out);
         if out.len() >= limit {
             return total_sum;
@@ -541,7 +591,7 @@ impl KmpDagIndex {
                 child,
                 child_sum,
                 k_right,
-                base_offset + left_sum.byte_len,
+                base_offset + left_len,
                 limit,
                 out,
                 scratch,
@@ -617,6 +667,17 @@ impl MappedArchive {
         if pattern.is_empty() {
             return Err(ButtlickError::EmptyPattern);
         }
+        if self
+            .roots
+            .iter()
+            .all(|root| root.byte_len < pattern.len() as u64)
+        {
+            return Ok(self
+                .roots
+                .iter()
+                .map(|root| (root.name.clone(), 0))
+                .collect());
+        }
         let roots: Vec<Option<SymbolId>> = self.roots.iter().map(|r| r.root_symbol).collect();
         let counts = self.count_literal_roots(pattern, &roots)?;
         Ok(self
@@ -673,7 +734,7 @@ impl MappedArchive {
                 .collect());
         }
         let transducer = compile_literal_transducer(pattern)?;
-        self.count_emissions(&transducer, roots, &String::from_utf8_lossy(pattern))
+        self.count_emissions::<true>(&transducer, roots, &String::from_utf8_lossy(pattern))
     }
 }
 
@@ -693,7 +754,7 @@ impl GrammarDag {
         if (pattern.len() as u64) > root.byte_len {
             return Ok(0);
         }
-        let index = KmpDagIndex::evaluate(self, pattern)?;
+        let index = KmpDagIndex::evaluate_root(self, pattern, sym)?;
         Ok(index.count_symbol(sym))
     }
 
@@ -715,7 +776,7 @@ impl GrammarDag {
         if (pattern.len() as u64) > root.byte_len {
             return Ok((0, Vec::new()));
         }
-        let index = KmpDagIndex::evaluate(self, pattern)?;
+        let index = KmpDagIndex::evaluate_root(self, pattern, sym)?;
         let total_count = index.count_symbol(sym);
         let mut offsets = Vec::with_capacity(limit.min(total_count as usize));
         if total_count > 0 && limit > 0 {

@@ -1,0 +1,12 @@
+verified query col2 ' '            9.632s    2117.6 MB out=587d71eca57b len=106 rc=0
+verified query col1 where          9.692s    2104.9 MB out=ed1d59600b6b len=59 rc=0
+verified slice near end            0.536s    1041.5 MB out=3127b173a909 len=4096 rc=0
+verified slice middle              0.528s    1041.5 MB out=1d7ccc86b18b len=100000 rc=0
+verified eq 1MB                    0.528s    1041.5 MB out=b73d74fcede9 len=6 rc=0
+verified eq self-ish               0.001s      16.0 MB out=724ba28f4a9a len=5 rc=0
+verified count struct              1.438s     782.5 MB out=0b3f78e40abc len=8 rc=0
+verified count offsets             0.934s    1106.6 MB out=228fdfe1dad0 len=195 rc=0
+verified slurp -c                  0.453s     609.5 MB out=151b80d6373a len=6 rc=0
+verified slurp -n lim              1.797s     927.5 MB out=7be2da3763c0 len=1495 rc=0
+verified decompress                5.973s    1013.4 MB out=8236fd0e23cf len=514408394 rc=0
+verified inspect                   0.590s     997.0 MB out=af3fcf025373 len=355 rc=0

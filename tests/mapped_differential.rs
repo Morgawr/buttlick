@@ -287,7 +287,9 @@ fn test_mapped_rejects_corrupted_rule_table() {
     // Point the last rule at itself (a cycle / forward reference).
     let n = raw.len();
     let last_rule = n - 8 - 8;
-    let num_rules = u64::from_le_bytes(raw[24..32].try_into().unwrap()) as u32;
+    let num_rules = buttlick::format::header::BtlkHeader::from_bytes(&raw)
+        .unwrap()
+        .num_rules as u32;
     let self_sym = 256 + num_rules - 1;
     raw[last_rule..last_rule + 4].copy_from_slice(&self_sym.to_le_bytes());
     raw[last_rule + 4..last_rule + 8].copy_from_slice(&self_sym.to_le_bytes());

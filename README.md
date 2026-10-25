@@ -43,15 +43,24 @@ buttlick slurp linux_kernel.btlk "EXPORT_SYMBOL_GPL" -c
 buttlick slurp linux_kernel.btlk "schedule_timeout" -n --doc kernel/sched/core.c
 ```
 
+`--match-count` counts non-overlapping matches with greedy, anchor, and empty-match semantics.
+Simple byte repetitions such as `a+`, `[a-z]*`, and fixed matches use compressed transducers.
+Compound greedy patterns such as `a.*b`, other nullable patterns, and contextual assertions
+use an exact regex engine that expands one document at a time. Exact counting can therefore
+need memory proportional to the largest selected document. Empty-string-only patterns need
+no expansion. Emission totals saturate at `u64::MAX` if their mathematical result is larger.
+
 ### 3. Extract byte slices directly without decompression
 
-Because the archive is a balanced tree, jumping to an arbitrary byte offset takes microseconds even on very large files
+Slices navigate the grammar using subtree lengths. Lengths are computed lazily for multi-document
+archives; single-document archives currently prefill a length table, so opening a large one has
+an O(number of rules) setup cost.
 
 ```bash
 # Read 256 bytes starting at offset 10,000,000
 buttlick slice linux_kernel.btlk --doc drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c --start 10000 --len 256
 
-# Check if two 1MB regions are byte-for-byte identical in O(log N) time
+# Compare two 1MB regions using a probabilistic 61-bit Karp-Rabin hash
 buttlick eq archive.btlk --pos1 0 --pos2 1048576 --len 1048576
 ```
 
@@ -87,6 +96,17 @@ buttlick edit input.btlk -o output.btlk insert --offset 0 --text "// Header\n"
 buttlick edit input.btlk -o output.btlk delete --offset 0 --len 10
 ```
 
+Multi-document edits require `--doc` (except `concat`, which names both inputs). Edits retain old
+rules for reuse. Use `edit --compact` to remove unreachable rules before saving, or compact an
+existing archive separately:
+
+```bash
+buttlick compact input.btlk -o compact.btlk
+```
+
+Compaction preserves every document and its bytes. It loads the decoded grammar and needs
+additional memory for reachability and symbol renumbering.
+
 ### 7. Decompress (`decompress` & `inspect`)
 
 ```bash
@@ -98,7 +118,23 @@ buttlick decompress linux_kernel.btlk --doc README > README
 
 # Inspect archive size, rule count, and tree height
 buttlick inspect linux_kernel.btlk
+
+# Check file integrity before running queries on untrusted or transferred storage
+buttlick verify linux_kernel.btlk
 ```
+
+`decompress` and `inspect` verify the checksum automatically. Search, slicing, equality, and
+aggregation validate rule structure as they visit it and skip the full checksum scan for latency;
+run `verify` explicitly when integrity verification is needed. Inputs and archives must remain
+unchanged while mapped. Compression stores regular files; recursive directory traversal skips
+symbolic links, empty directories, and special files (counts are reported with `--stats`).
+Explicit input paths follow symbolic links. Unreadable inputs fail the
+command rather than silently producing an incomplete archive. Duplicate document names also
+fail compression; the library's named insertion APIs consistently replace an existing name.
+
+Numeric queries accept signed `i64` fields, including leading zeros, and ignore invalid or
+out-of-range fields. For log-style `key=value` fields, the target column uses the suffix after
+the first `=`; filters match either that suffix or the complete field.
 
 ---
 
@@ -111,16 +147,31 @@ Instead of sliding-window LZ77 + entropy coding (which destroys random access an
    - `Pair(left, right)`: concatenates two symbols (`left` followed by `right`).
    - `Run(child, count)`: repeats `child` `count` times in a row.
 
-   Identical substrings, tokens, and lines anywhere across the archive are hash-consed to the exact same 32-bit `SymbolId`. If a boilerplate header or log prefix appears 50,000 times across 10,000 files, it is represented by a single rule subtree.
+   Reused tokens and lines share 32-bit `SymbolId`s. Bulk ingestion limits cross-chunk pair
+   indexing to short expansions to bound dictionary memory, so arbitrary identical substrings
+   are not guaranteed to share one subtree.
 
 2. **Deterministic Cut Points (Locally Consistent Parsing)**:
    When two files differ by a few bytes in the middle, naive pair-folding shifts boundaries and ruins deduplication. `buttlick` picks merge boundaries using local hash landmarks (local maxima/minima of adjacent symbol hashes), so edits stay localized and identical surrounding text always compiles to the same rule IDs.
 
 3. **Bottom-Up Query Evaluation (Why `slurp` is fast)**:
    On disk, the `.btlk` rule table is stored as a flat array of 8-byte `PackedRuleNode` structs in topological order (children always have lower IDs than parents).
-   - When you run `buttlick slurp`, the binary `mmap`s the `.btlk` file directly from the OS page cache with near-zero RAM overhead (~18 MB RSS on a 200 MB archive).
-   - For literal queries, a single bottom-up pass checks if the pattern appears at the seam between `left` and `right` of each rule. Because rules are evaluated in order, if a rule matches, that result is reused everywhere the rule appears.
+   - `buttlick slurp` maps the packed rule table and evaluates a finite-state transducer over it.
+     State cells use 1 or 2 bytes per symbol, with additional memoized states and emission counts.
+     Memory depends on the query and reachable rules; mmap pages also contribute to RSS.
+   - Literal search uses an overlapping KMP transducer. Bottom-up summaries are reused wherever
+     rules appear. Single-document search in a multi-document archive visits only reachable rules.
    - To print matching lines (`-n`), `buttlick` only descends into branches flagged as containing a match and expands the surrounding `[prev_newline, next_newline]` span. Branches without matches are skipped in $O(1)$.
 
 4. **$O(\log N)$ Random Access & Slicing**:
-   Each rule stores its expanded byte length and a 61-bit Karp-Rabin hash. Because the grammar tree height is bounded ($H \approx 30\text{–}40$ even for multi-gigabyte corpora), `slice` and `eq` walk down from a document's root symbol using subtree byte lengths like a B-tree, touching only the nodes along the path.
+   Expanded lengths and 61-bit Karp-Rabin hashes are derived from packed rules and cached as
+   needed. Slicing follows the requested range; hashing a previously unseen full subtree can
+   visit all its reachable rules. Hash equality is probabilistic, not a byte-for-byte proof.
+
+The format stores 8 bytes per rule without entropy coding. Compression is workload-dependent:
+the handoff's Linux source corpus produced a 1.35x input/archive ratio, while a concatenated
+514 MB C file produced 0.95x (larger than its input). Highly repetitive logs compress much better.
+These corpus measurements are examples, not a general compression or memory guarantee.
+
+Library callers should prefer `MappedArchive` for large read workloads. The decoded
+`MealyTransducer::evaluate_dag` API allocates a rule-by-state table, which can be much larger.

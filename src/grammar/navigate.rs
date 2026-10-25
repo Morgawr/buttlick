@@ -1,5 +1,5 @@
 use crate::error::{ButtlickError, Result};
-use crate::grammar::repeat_tail;
+use crate::grammar::{check_range, repeat_tail};
 use crate::grammar::{GrammarDag, RuleKind, SymbolId};
 use crate::hash::{combine_hashes, repeat_hash_and_pow};
 
@@ -156,13 +156,7 @@ impl GrammarDag {
     /// Extracts the byte slice `[start, start + len)` from a named document in O(log N + len) time.
     pub fn extract_slice(&self, doc_name: Option<&str>, start: u64, len: u64) -> Result<Vec<u8>> {
         let root = self.find_root(doc_name)?;
-        if start.saturating_add(len) > root.byte_len {
-            return Err(ButtlickError::OutOfBounds {
-                offset: start,
-                len,
-                total: root.byte_len,
-            });
-        }
+        check_range(root, start, len)?;
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -196,13 +190,7 @@ impl GrammarDag {
     /// Computes the exact Karp-Rabin hash of `[start, start + len)` in a named document in O(log N) time.
     pub fn range_hash(&self, doc_name: Option<&str>, start: u64, len: u64) -> Result<u64> {
         let root = self.find_root(doc_name)?;
-        if start.saturating_add(len) > root.byte_len {
-            return Err(ButtlickError::OutOfBounds {
-                offset: start,
-                len,
-                total: root.byte_len,
-            });
-        }
+        check_range(root, start, len)?;
         if len == 0 {
             return Ok(0);
         }
@@ -220,20 +208,8 @@ impl GrammarDag {
         len: u64,
     ) -> Result<bool> {
         let root = self.find_root(doc_name)?;
-        if pos1.saturating_add(len) > root.byte_len {
-            return Err(ButtlickError::OutOfBounds {
-                offset: pos1,
-                len,
-                total: root.byte_len,
-            });
-        }
-        if pos2.saturating_add(len) > root.byte_len {
-            return Err(ButtlickError::OutOfBounds {
-                offset: pos2,
-                len,
-                total: root.byte_len,
-            });
-        }
+        check_range(root, pos1, len)?;
+        check_range(root, pos2, len)?;
         if len == 0 || pos1 == pos2 {
             return Ok(true);
         }

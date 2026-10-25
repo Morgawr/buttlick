@@ -170,7 +170,7 @@ impl<'s> LocalChunkCompressor<'s> {
         pair_map.reserve(est_rules);
         let mut run_map = FxHashMap::default();
         run_map.reserve(est_rules / 8);
-        let seed_watermark = SymbolId::from_rule_index(seed_rules.len()).0;
+        let seed_watermark = SymbolId::rule_watermark(seed_rules.len());
         Self {
             seed_rules,
             seed_interner,
@@ -227,7 +227,9 @@ impl<'s> LocalChunkCompressor<'s> {
         if base_child.0 < self.seed_watermark {
             if let Some(si) = self.seed_interner {
                 if let Some(existing) = si.get_run(base_child, total_count) {
-                    return existing;
+                    if existing.0 < self.seed_watermark {
+                        return existing;
+                    }
                 }
             }
         }
@@ -269,7 +271,9 @@ impl<'s> LocalChunkCompressor<'s> {
         {
             if let Some(si) = self.seed_interner {
                 if let Some(existing) = si.get_pair(left, right) {
-                    return existing;
+                    if existing.0 < self.seed_watermark {
+                        return existing;
+                    }
                 }
             }
         }
@@ -766,6 +770,102 @@ impl LcpBuilder for LocalChunkCompressor<'_> {
 
 type LineUnit<'a> = (&'a [u8], u64);
 
+struct DeduplicatedUnits<'a> {
+    unique_units: Vec<&'a [u8]>,
+    unique_hashes: Vec<u64>,
+    doc_unit_ranges: Vec<std::ops::Range<usize>>,
+    unit_to_sym: Vec<u32>,
+}
+
+/// Resolve cached symbols and deduplicate new line units without touching the rule table.
+fn deduplicate_line_units<'a>(
+    doc_units_and_hashes: &[(Vec<LineUnit<'a>>, u64)],
+    interner: &mut RuleInterner,
+) -> DeduplicatedUnits<'a> {
+    let total_units: usize = doc_units_and_hashes.iter().map(|(u, _)| u.len()).sum();
+    assert!(
+        total_units <= (1usize << 31),
+        "batch exceeds the 31-bit line-unit limit"
+    );
+    let est_unique = (total_units * 3) / 5 + 1;
+    let mut unique_units: Vec<&[u8]> = Vec::with_capacity(est_unique);
+    let mut unique_hashes: Vec<u64> = Vec::with_capacity(est_unique);
+    let mut doc_unit_ranges: Vec<std::ops::Range<usize>> =
+        Vec::with_capacity(doc_units_and_hashes.len());
+    // Bit 31 == 0 => already-resolved SymbolId(v); Bit 31 == 1 => unique_root_syms[(v & 0x7FFF_FFFF)]
+    let mut unit_to_sym: Vec<u32> = Vec::with_capacity(total_units);
+
+    if total_units >= 65_536 {
+        let seen = interner.prepare_seen_table();
+        for (units, _) in doc_units_and_hashes {
+            let start = unit_to_sym.len();
+            for &(slice, hash) in units {
+                if slice.is_empty() {
+                    unit_to_sym.push(hash as u32);
+                    continue;
+                }
+                let slot = &mut seen[(hash as usize) & SEEN_TABLE_MASK];
+                let prev = *slot;
+                if prev != u32::MAX {
+                    let u_idx = prev as usize;
+                    if unique_hashes[u_idx] == hash && unique_units[u_idx] == slice {
+                        unit_to_sym.push(0x8000_0000 | prev);
+                        continue;
+                    }
+                }
+                let u_idx = unique_units.len() as u32;
+                *slot = u_idx;
+                unique_units.push(slice);
+                unique_hashes.push(hash);
+                unit_to_sym.push(0x8000_0000 | u_idx);
+            }
+            let end = unit_to_sym.len();
+            doc_unit_ranges.push(start..end);
+        }
+    } else {
+        let mut seen: FxHashMap<u64, u32> = FxHashMap::default();
+        seen.reserve(est_unique);
+        for (units, _) in doc_units_and_hashes {
+            let start = unit_to_sym.len();
+            for &(slice, hash) in units {
+                if slice.is_empty() {
+                    unit_to_sym.push(hash as u32);
+                    continue;
+                }
+                match seen.entry(hash) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        let u_idx = *e.get();
+                        if unique_units[u_idx as usize] == slice {
+                            unit_to_sym.push(0x8000_0000 | u_idx);
+                            continue;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        let u_idx = unique_units.len() as u32;
+                        v.insert(u_idx);
+                        unique_units.push(slice);
+                        unique_hashes.push(hash);
+                        unit_to_sym.push(0x8000_0000 | u_idx);
+                        continue;
+                    }
+                }
+                let u_idx = unique_units.len() as u32;
+                unique_units.push(slice);
+                unique_hashes.push(hash);
+                unit_to_sym.push(0x8000_0000 | u_idx);
+            }
+            let end = unit_to_sym.len();
+            doc_unit_ranges.push(start..end);
+        }
+    }
+    DeduplicatedUnits {
+        unique_units,
+        unique_hashes,
+        doc_unit_ranges,
+        unit_to_sym,
+    }
+}
+
 fn split_into_line_units_seq<'a>(
     bytes: &'a [u8],
     rules_ref: &[RuleNode],
@@ -978,8 +1078,8 @@ impl GrammarDag {
         out_roots: &mut Vec<SymbolId>,
     ) {
         self.ensure_interner();
-        let seed_watermark = SymbolId::from_rule_index(seed_len).0;
-        let watermark = SymbolId::from_rule_index(self.rules.len()).0;
+        let seed_watermark = SymbolId::rule_watermark(seed_len);
+        let watermark = SymbolId::rule_watermark(self.rules.len());
         remap_scratch.clear();
         remap_scratch.reserve(local.nodes.len());
 
@@ -1078,105 +1178,9 @@ impl GrammarDag {
         self.compress_symbol_sequence(unit_syms)
     }
 
-    /// Compresses multiple documents in parallel across all CPU cores into the shared `GrammarDag`.
-    pub fn add_documents_parallel(&mut self, docs: &[(String, Vec<u8>)]) -> Vec<RootEntry> {
-        let need_exact_kr = self.roots.len() + docs.len() <= 64;
-        let rules_ref = &self.rules[..];
-        let line_cache_ref = &self.interner.line_cache;
-
-        // Step 1: Segment all documents into line units + resolve cross-batch line_cache hits in parallel!
-        let doc_units_and_hashes: Vec<(Vec<LineUnit<'_>>, u64)> = docs
-            .par_iter()
-            .map(|(_, bytes)| {
-                let units = split_into_line_units_cached(bytes, rules_ref, line_cache_ref);
-                let kr = if need_exact_kr {
-                    parallel_kr_hash(bytes)
-                } else {
-                    let mut h = 0xcbf29ce484222325u64;
-                    for &(_, uh) in &units {
-                        h = h.rotate_left(13) ^ uh;
-                    }
-                    h
-                };
-                (units, kr)
-            })
-            .collect();
-
-        // Step 2: Deduplicate new line units across the batch before running LCP!
-        let total_units: usize = doc_units_and_hashes.iter().map(|(u, _)| u.len()).sum();
-        let est_unique = (total_units * 3) / 5 + 1;
-        let mut unique_units: Vec<&[u8]> = Vec::with_capacity(est_unique);
-        let mut unique_hashes: Vec<u64> = Vec::with_capacity(est_unique);
-        let mut doc_unit_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(docs.len());
-        // Bit 31 == 0 => already-resolved SymbolId(v); Bit 31 == 1 => unique_root_syms[(v & 0x7FFF_FFFF)]
-        let mut unit_to_sym: Vec<u32> = Vec::with_capacity(total_units);
-
-        if total_units >= 65_536 {
-            let seen = self.interner.prepare_seen_table();
-            for (units, _) in &doc_units_and_hashes {
-                let start = unit_to_sym.len();
-                for &(slice, hash) in units {
-                    if slice.is_empty() {
-                        unit_to_sym.push(hash as u32);
-                        continue;
-                    }
-                    let slot = &mut seen[(hash as usize) & SEEN_TABLE_MASK];
-                    let prev = *slot;
-                    if prev != u32::MAX {
-                        let u_idx = prev as usize;
-                        if unique_hashes[u_idx] == hash && unique_units[u_idx] == slice {
-                            unit_to_sym.push(0x8000_0000 | prev);
-                            continue;
-                        }
-                    }
-                    let u_idx = unique_units.len() as u32;
-                    *slot = u_idx;
-                    unique_units.push(slice);
-                    unique_hashes.push(hash);
-                    unit_to_sym.push(0x8000_0000 | u_idx);
-                }
-                let end = unit_to_sym.len();
-                doc_unit_ranges.push(start..end);
-            }
-        } else {
-            let mut seen: FxHashMap<u64, u32> = FxHashMap::default();
-            seen.reserve(est_unique);
-            for (units, _) in &doc_units_and_hashes {
-                let start = unit_to_sym.len();
-                for &(slice, hash) in units {
-                    if slice.is_empty() {
-                        unit_to_sym.push(hash as u32);
-                        continue;
-                    }
-                    match seen.entry(hash) {
-                        std::collections::hash_map::Entry::Occupied(e) => {
-                            let u_idx = *e.get();
-                            if unique_units[u_idx as usize] == slice {
-                                unit_to_sym.push(0x8000_0000 | u_idx);
-                                continue;
-                            }
-                        }
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            let u_idx = unique_units.len() as u32;
-                            v.insert(u_idx);
-                            unique_units.push(slice);
-                            unique_hashes.push(hash);
-                            unit_to_sym.push(0x8000_0000 | u_idx);
-                            continue;
-                        }
-                    }
-                    let u_idx = unique_units.len() as u32;
-                    unique_units.push(slice);
-                    unique_hashes.push(hash);
-                    unit_to_sym.push(0x8000_0000 | u_idx);
-                }
-                let end = unit_to_sym.len();
-                doc_unit_ranges.push(start..end);
-            }
-        }
-
-        // Step 3 & Step 4: Compress only the new unique line units in parallel and merge into global GrammarDag!
-        let partitions = group_into_partitions(&unique_units);
+    /// Compress and merge the new line dictionary, preserving deterministic partition order.
+    fn merge_ingestion_units(&mut self, unique_units: &[&[u8]]) -> Vec<SymbolId> {
+        let partitions = group_into_partitions(unique_units);
         let mut remap_scratch = Vec::new();
         let mut unique_root_syms: Vec<SymbolId> = Vec::with_capacity(unique_units.len());
 
@@ -1220,7 +1224,7 @@ impl GrammarDag {
 
             let total_local_nodes: usize = local_dags.iter().map(|d| d.nodes.len()).sum();
             self.rules.reserve(total_local_nodes);
-            let seed_watermark = SymbolId::from_rule_index(seed_len).0;
+            let seed_watermark = SymbolId::rule_watermark(seed_len);
 
             let mut split_idx = 0usize;
             let max_merge = local_dags.len().min(8);
@@ -1247,6 +1251,10 @@ impl GrammarDag {
                     cur_rules_len += local.nodes.len();
                     cur_roots_len += local.roots.len();
                 }
+                assert!(
+                    cur_rules_len <= (1usize << 31) - 256,
+                    "rule table exceeds the .btlk symbol limit"
+                );
 
                 let added_rules = cur_rules_len - start_rules_len;
                 let added_roots = cur_roots_len - start_roots_len;
@@ -1304,19 +1312,18 @@ impl GrammarDag {
                 }
             }
         }
+        unique_root_syms
+    }
 
-        // Populate persistent cross-batch direct-mapped line_cache for lines <= 256 bytes
-        self.interner.ensure_line_cache();
-        let lc = &mut self.interner.line_cache[..];
-        for (i, &slice) in unique_units.iter().enumerate() {
-            if slice.len() <= 256 {
-                let h = unique_hashes[i];
-                lc[(h as usize) & LINE_CACHE_MASK] = (h, unique_root_syms[i]);
-            }
-        }
-        drop(unique_hashes);
-
-        // Step 5: Reduce each document's line unit symbol sequence to a single root symbol in parallel across all CPU cores!
+    /// Build balanced roots from resolved line symbols, then append disjoint document trees.
+    fn build_document_roots<B>(
+        &mut self,
+        docs: &[(String, B)],
+        doc_unit_ranges: &[std::ops::Range<usize>],
+        unit_to_sym: &[u32],
+        unique_root_syms: &[SymbolId],
+    ) -> Vec<Option<SymbolId>> {
+        let total_units = unit_to_sym.len();
         let base_rules_len = self.rules.len();
         let target_units_per_part = (total_units / 32).max(4096);
         let mut doc_part_ranges: Vec<std::ops::Range<usize>> = Vec::new();
@@ -1383,6 +1390,10 @@ impl GrammarDag {
             doc_offsets.push((cur_doc_rules_len - base_rules_len) as u32);
             cur_doc_rules_len += local_nodes.len();
         }
+        assert!(
+            cur_doc_rules_len <= (1usize << 31) - 256,
+            "rule table exceeds the .btlk symbol limit"
+        );
         let added_doc_rules = cur_doc_rules_len - base_rules_len;
         self.rules.reserve(added_doc_rules);
         let mut doc_root_syms: Vec<Option<SymbolId>> = vec![None; docs.len()];
@@ -1402,7 +1413,7 @@ impl GrammarDag {
             rem_doc_roots = r_tail;
         }
 
-        let base_watermark = SymbolId::from_rule_index(base_rules_len).0;
+        let base_watermark = SymbolId::rule_watermark(base_rules_len);
         doc_tree_parts
             .into_par_iter()
             .zip(doc_node_slices.into_par_iter())
@@ -1446,8 +1457,59 @@ impl GrammarDag {
             self.rules.set_len(cur_doc_rules_len);
         }
         self.interner.set_indexed_rules(self.rules.len());
+        doc_root_syms
+    }
 
-        let check_existing = self.roots.len() <= 64;
+    /// Compresses multiple documents in parallel across all CPU cores into the shared `GrammarDag`.
+    pub fn add_documents_parallel<B: AsRef<[u8]> + Sync>(
+        &mut self,
+        docs: &[(String, B)],
+    ) -> Vec<RootEntry> {
+        let rules_ref = &self.rules[..];
+        let line_cache_ref = &self.interner.line_cache;
+
+        // Step 1: Segment all documents into line units + resolve cross-batch line_cache hits in parallel!
+        let doc_units_and_hashes: Vec<(Vec<LineUnit<'_>>, u64)> = docs
+            .par_iter()
+            .map(|(_, bytes)| {
+                let bytes = bytes.as_ref();
+                let units = split_into_line_units_cached(bytes, rules_ref, line_cache_ref);
+                let kr = parallel_kr_hash(bytes);
+                (units, kr)
+            })
+            .collect();
+
+        let DeduplicatedUnits {
+            unique_units,
+            unique_hashes,
+            doc_unit_ranges,
+            unit_to_sym,
+        } = deduplicate_line_units(&doc_units_and_hashes, &mut self.interner);
+
+        let unique_root_syms = self.merge_ingestion_units(&unique_units);
+
+        // Populate persistent cross-batch direct-mapped line_cache for lines <= 256 bytes
+        self.interner.ensure_line_cache();
+        let lc = &mut self.interner.line_cache[..];
+        for (i, &slice) in unique_units.iter().enumerate() {
+            if slice.len() <= 256 {
+                let h = unique_hashes[i];
+                lc[(h as usize) & LINE_CACHE_MASK] = (h, unique_root_syms[i]);
+            }
+        }
+        drop(unique_hashes);
+
+        let doc_root_syms =
+            self.build_document_roots(docs, &doc_unit_ranges, &unit_to_sym, &unique_root_syms);
+
+        // Keep replacement semantics independent of archive size, without an O(roots * docs)
+        // name scan. Include new roots immediately so duplicates within this batch also replace.
+        let mut root_indices: FxHashMap<String, usize> = self
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(idx, root)| (root.name.clone(), idx))
+            .collect();
         self.roots.reserve(docs.len());
         let mut entries = Vec::with_capacity(docs.len());
         for ((name, _), ((units, doc_kr_hash), root_symbol)) in docs.iter().zip(
@@ -1466,9 +1528,10 @@ impl GrammarDag {
                 byte_len,
                 kr_hash: doc_kr_hash,
             };
-            if check_existing {
-                self.upsert_root(entry.clone());
+            if let Some(&idx) = root_indices.get(name) {
+                self.roots[idx] = entry.clone();
             } else {
+                root_indices.insert(name.clone(), self.roots.len());
                 self.roots.push(entry.clone());
             }
             entries.push(entry);
@@ -1523,7 +1586,7 @@ impl GrammarDag {
         let name = name.into();
         let root_symbol = self.compress_bytes(bytes);
         let (byte_len, kr_hash) = match root_symbol {
-            Some(sym) => (self.sym_len(sym), self.sym_hash(sym)),
+            Some(sym) => (self.sym_len(sym), parallel_kr_hash(bytes)),
             None => (0, 0),
         };
         let entry = RootEntry {
