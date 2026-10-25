@@ -1,4 +1,0 @@
-before edit insert 18.514s rss=8186.8 MB archive=1239786288
-before edited document sha256=d3344ba0dd15647d65e18c8e32527bef2e637056555accb60a73cd863dc0faa7
-new edit insert 5.552s rss=5897.1 MB archive=1239786352
-new edited document sha256=d3344ba0dd15647d65e18c8e32527bef2e637056555accb60a73cd863dc0faa7
