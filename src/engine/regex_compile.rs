@@ -74,21 +74,19 @@ pub fn compile_line_grep_transducer(pattern: &str) -> Result<MealyTransducer> {
         dfa_to_trans.insert(q_dfa_start, IDLE_LINE_START);
     }
 
-    let map_active_state = |sid: StateID,
-                            map: &mut FxHashMap<StateID, u16>,
-                            vec: &mut Vec<StateID>|
-     -> u16 {
-        if dfa.is_match_state(sid) {
-            return MATCHED_LINE;
-        }
-        if let Some(&existing) = map.get(&sid) {
-            return existing;
-        }
-        let new_id = (vec.len() + 2) as u16;
-        map.insert(sid, new_id);
-        vec.push(sid);
-        new_id
-    };
+    let map_active_state =
+        |sid: StateID, map: &mut FxHashMap<StateID, u16>, vec: &mut Vec<StateID>| -> u16 {
+            if dfa.is_match_state(sid) {
+                return MATCHED_LINE;
+            }
+            if let Some(&existing) = map.get(&sid) {
+                return existing;
+            }
+            let new_id = (vec.len() + 2) as u16;
+            map.insert(sid, new_id);
+            vec.push(sid);
+            new_id
+        };
 
     // Seed reachable active states from `q_dfa_start` on all non-'\n' bytes
     let mut start_non_nl_next = [0u16; 256];
@@ -214,18 +212,16 @@ pub fn compile_match_count_transducer(pattern: &str) -> Result<MealyTransducer> 
     let mut dfa_to_trans: FxHashMap<StateID, u16> = FxHashMap::default();
     let mut trans_to_dfa: Vec<StateID> = Vec::new();
 
-    let intern_state = |sid: StateID,
-                        map: &mut FxHashMap<StateID, u16>,
-                        vec: &mut Vec<StateID>|
-     -> u16 {
-        if let Some(&id) = map.get(&sid) {
-            return id;
-        }
-        let id = vec.len() as u16;
-        map.insert(sid, id);
-        vec.push(sid);
-        id
-    };
+    let intern_state =
+        |sid: StateID, map: &mut FxHashMap<StateID, u16>, vec: &mut Vec<StateID>| -> u16 {
+            if let Some(&id) = map.get(&sid) {
+                return id;
+            }
+            let id = vec.len() as u16;
+            map.insert(sid, id);
+            vec.push(sid);
+            id
+        };
 
     let start_state = intern_state(q_start_bol, &mut dfa_to_trans, &mut trans_to_dfa);
 
@@ -606,7 +602,10 @@ impl<'a, C: PackedCell> PackedEval<'a, C> {
                 let lc = Self::emit0_count(left, l_val, &emit0_counts);
                 if l_val.state() == 0 {
                     let r_val = self.table_at(right);
-                    (r_val | l_val, lc + Self::emit0_count(right, r_val, &emit0_counts))
+                    (
+                        r_val | l_val,
+                        lc + Self::emit0_count(right, r_val, &emit0_counts),
+                    )
                 } else {
                     let (r_val, rc) =
                         self.eval_sym_count_state(right, l_val.state(), &emit0_counts, &mut memo);
@@ -652,11 +651,21 @@ impl<'a, C: PackedCell> PackedEval<'a, C> {
         let res = if !packed.is_run() {
             let (l_val, lc) =
                 self.eval_sym_count_state(SymbolId(packed.word0), q, emit0_counts, memo);
-            let (r_val, rc) =
-                self.eval_sym_count_state(SymbolId(packed.word1), l_val.state(), emit0_counts, memo);
+            let (r_val, rc) = self.eval_sym_count_state(
+                SymbolId(packed.word1),
+                l_val.state(),
+                emit0_counts,
+                memo,
+            );
             (r_val | l_val.emit_bit(), lc + rc)
         } else {
-            self.eval_run_count_state(packed.first_sym(), packed.word1 as u64, q, emit0_counts, memo)
+            self.eval_run_count_state(
+                packed.first_sym(),
+                packed.word1 as u64,
+                q,
+                emit0_counts,
+                memo,
+            )
         };
         memo.insert(key, res);
         res
@@ -739,7 +748,8 @@ impl<'a, C: PackedCell> PackedEval<'a, C> {
                 if walk.out.len() >= walk.limit {
                     break;
                 }
-                let (cv, _) = self.eval_sym_count_state(child, cur_q, walk.emit0_counts, &mut walk.memo);
+                let (cv, _) =
+                    self.eval_sym_count_state(child, cur_q, walk.emit0_counts, &mut walk.memo);
                 if !cv.emitted() && cv.state() == cur_q {
                     // Every remaining repetition is identical and emits nothing.
                     break;
@@ -837,7 +847,8 @@ impl<'a, C: PackedCell> PackedEval<'a, C> {
                 if i > 0 {
                     left_siblings.push((child, i));
                 }
-                cur_q = self.walk_emitted_lines(child, cur_q, limit, memo, left_siblings, out_lines);
+                cur_q =
+                    self.walk_emitted_lines(child, cur_q, limit, memo, left_siblings, out_lines);
                 if i > 0 {
                     left_siblings.pop();
                 }
@@ -992,8 +1003,13 @@ impl MappedArchive {
                 if remaining == 0 {
                     break;
                 }
-                let lines =
-                    eval.collect_root_lines(transducer, sym, remaining, &mut memo, &mut left_siblings);
+                let lines = eval.collect_root_lines(
+                    transducer,
+                    sym,
+                    remaining,
+                    &mut memo,
+                    &mut left_siblings,
+                );
                 if !lines.is_empty() {
                     remaining = remaining.saturating_sub(lines.len());
                     results.push((name.to_string(), lines));

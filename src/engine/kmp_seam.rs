@@ -311,30 +311,28 @@ impl KmpDagIndex {
 
         for node in &dag.rules {
             let sum = match node.kind {
-                RuleKind::Pair { left, right } => {
-                    match (left.as_byte(), right.as_byte()) {
-                        (Some(lb), Some(rb)) => {
-                            let ls = SeamSummary::from_terminal(lb, m);
-                            let rs = SeamSummary::from_terminal(rb, m);
-                            combine_seam(&ls, &rs, pattern, &pi, &mut seam_scratch)
-                        }
-                        (Some(lb), None) => {
-                            let ls = SeamSummary::from_terminal(lb, m);
-                            let rs = &summaries[right.rule_index()];
-                            combine_seam(&ls, rs, pattern, &pi, &mut seam_scratch)
-                        }
-                        (None, Some(rb)) => {
-                            let ls = &summaries[left.rule_index()];
-                            let rs = SeamSummary::from_terminal(rb, m);
-                            combine_seam(ls, &rs, pattern, &pi, &mut seam_scratch)
-                        }
-                        (None, None) => {
-                            let ls = &summaries[left.rule_index()];
-                            let rs = &summaries[right.rule_index()];
-                            combine_seam(ls, rs, pattern, &pi, &mut seam_scratch)
-                        }
+                RuleKind::Pair { left, right } => match (left.as_byte(), right.as_byte()) {
+                    (Some(lb), Some(rb)) => {
+                        let ls = SeamSummary::from_terminal(lb, m);
+                        let rs = SeamSummary::from_terminal(rb, m);
+                        combine_seam(&ls, &rs, pattern, &pi, &mut seam_scratch)
                     }
-                }
+                    (Some(lb), None) => {
+                        let ls = SeamSummary::from_terminal(lb, m);
+                        let rs = &summaries[right.rule_index()];
+                        combine_seam(&ls, rs, pattern, &pi, &mut seam_scratch)
+                    }
+                    (None, Some(rb)) => {
+                        let ls = &summaries[left.rule_index()];
+                        let rs = SeamSummary::from_terminal(rb, m);
+                        combine_seam(ls, &rs, pattern, &pi, &mut seam_scratch)
+                    }
+                    (None, None) => {
+                        let ls = &summaries[left.rule_index()];
+                        let rs = &summaries[right.rule_index()];
+                        combine_seam(ls, rs, pattern, &pi, &mut seam_scratch)
+                    }
+                },
                 RuleKind::Run { child, count } => {
                     let cs = get_summary(child, &summaries);
                     power_seam(&cs, count, pattern, &pi, &mut seam_scratch)
@@ -377,13 +375,7 @@ impl KmpDagIndex {
     }
 
     /// Extracts the first `limit` 64-bit byte offsets of matches inside `sym` in O(k log N) time.
-    pub fn locate_symbol(
-        &self,
-        dag: &GrammarDag,
-        sym: SymbolId,
-        limit: usize,
-        out: &mut Vec<u64>,
-    ) {
+    pub fn locate_symbol(&self, dag: &GrammarDag, sym: SymbolId, limit: usize, out: &mut Vec<u64>) {
         if limit == 0 || self.count_symbol(sym) == 0 {
             return;
         }
@@ -654,14 +646,19 @@ impl MappedArchive {
             return Ok((0, Vec::new()));
         }
         if pattern.len() > MAX_MAPPED_LITERAL_LEN {
-            return self.load_grammar_dag()?.locate_literal(doc_name, pattern, limit);
+            return self
+                .load_grammar_dag()?
+                .locate_literal(doc_name, pattern, limit);
         }
         let transducer = compile_literal_transducer(pattern)?;
         let (count, match_ends) =
             self.locate_emissions(&transducer, sym, limit, &String::from_utf8_lossy(pattern))?;
         // The transducer emits on the last byte of each occurrence.
         let m = pattern.len() as u64;
-        Ok((count, match_ends.into_iter().map(|end| end + 1 - m).collect()))
+        Ok((
+            count,
+            match_ends.into_iter().map(|end| end + 1 - m).collect(),
+        ))
     }
 
     fn count_literal_roots(&self, pattern: &[u8], roots: &[Option<SymbolId>]) -> Result<Vec<u64>> {
@@ -759,7 +756,15 @@ mod tests {
         // Periodic multi-byte child ("ABABAB" in ("AB")^50)
         let data2 = b"AB".repeat(50);
         let dag2 = GrammarDag::from_bytes(&data2);
-        for pat in &[b"A".as_slice(), b"AB", b"BA", b"ABA", b"BAB", b"ABABAB", b"BABABA"] {
+        for pat in &[
+            b"A".as_slice(),
+            b"AB",
+            b"BA",
+            b"ABA",
+            b"BAB",
+            b"ABABAB",
+            b"BABABA",
+        ] {
             let (count, offsets) = dag2.locate_literal(None, pat, usize::MAX).unwrap();
             let expected = brute_force_offsets(&data2, pat);
             assert_eq!(count, expected.len() as u64, "Failed count for {:?}", pat);

@@ -221,10 +221,7 @@ mod tests {
             if id != b'\n' as u32 {
                 assert_ne!(landmark_hash(SymbolId(id)), 0);
             }
-            assert_ne!(
-                landmark_hash(SymbolId(id)),
-                landmark_hash(SymbolId(id + 1))
-            );
+            assert_ne!(landmark_hash(SymbolId(id)), landmark_hash(SymbolId(id + 1)));
         }
     }
 }

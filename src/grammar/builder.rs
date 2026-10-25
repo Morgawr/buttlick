@@ -80,7 +80,9 @@ impl RuleInterner {
 
     #[inline(always)]
     pub fn get_pair(&self, left: SymbolId, right: SymbolId) -> Option<SymbolId> {
-        self.pair_map.get(&Self::pack_pair_key(left, right)).copied()
+        self.pair_map
+            .get(&Self::pack_pair_key(left, right))
+            .copied()
     }
 
     #[inline(always)]

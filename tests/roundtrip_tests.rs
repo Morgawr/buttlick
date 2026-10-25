@@ -12,9 +12,7 @@ fn test_exhaustive_small_and_repetitive_roundtrips() {
     // 1. Lengths 0..=128 with varying alphabet sizes
     for len in 0..=128 {
         for alpha in [1u8, 2, 3, 4, 16, 255] {
-            let data: Vec<u8> = (0..len)
-                .map(|_| rng.gen_range(0..=alpha))
-                .collect();
+            let data: Vec<u8> = (0..len).map(|_| rng.gen_range(0..=alpha)).collect();
             let dag = GrammarDag::from_bytes(&data);
             dag.validate_invariants().unwrap();
             assert_eq!(dag.decompress(None).unwrap(), data);

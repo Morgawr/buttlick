@@ -166,7 +166,11 @@ impl GrammarDag {
         }
     }
 
-    fn update_root_symbol(&mut self, doc_name: Option<&str>, new_sym: Option<SymbolId>) -> Result<()> {
+    fn update_root_symbol(
+        &mut self,
+        doc_name: Option<&str>,
+        new_sym: Option<SymbolId>,
+    ) -> Result<()> {
         let (byte_len, kr_hash) = match new_sym {
             Some(s) => (self.sym_len(s), self.sym_hash(s)),
             None => (0, 0),
@@ -461,9 +465,10 @@ impl GrammarDag {
                     unconsumed_suffix: Vec::new(),
                 },
                 Some(r_rem_sym) => {
-                    let rem_chunk = self
-                        .rewrite_symbol_memo(r_rem_sym, pattern, pi, repl_sym, kmp_index, memo);
-                    let rewritten_sym = self.concat_symbols(left_plus_repl, rem_chunk.rewritten_sym);
+                    let rem_chunk =
+                        self.rewrite_symbol_memo(r_rem_sym, pattern, pi, repl_sym, kmp_index, memo);
+                    let rewritten_sym =
+                        self.concat_symbols(left_plus_repl, rem_chunk.rewritten_sym);
                     RewriteChunk {
                         orig_sym,
                         rewritten_sym,
@@ -529,8 +534,8 @@ impl GrammarDag {
             }
             k >>= 1;
             if k > 0 {
-                cur = self
-                    .combine_rewrite_chunks(&cur, &cur, pattern, pi, repl_sym, kmp_index, memo);
+                cur =
+                    self.combine_rewrite_chunks(&cur, &cur, pattern, pi, repl_sym, kmp_index, memo);
             }
         }
         acc.unwrap()
@@ -581,10 +586,7 @@ mod tests {
         dag.concat_documents("default", "doc2", "combined").unwrap();
         let mut expected_combined = ref_vec.clone();
         expected_combined.extend_from_slice(b" --- appended suffix!");
-        assert_eq!(
-            dag.decompress(Some("combined")).unwrap(),
-            expected_combined
-        );
+        assert_eq!(dag.decompress(Some("combined")).unwrap(), expected_combined);
         dag.validate_invariants().unwrap();
     }
 

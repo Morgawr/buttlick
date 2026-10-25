@@ -110,11 +110,12 @@ impl BtlkLayout {
         let roots_offset = header.roots_offset as usize;
         let rules_offset = header.rules_offset as usize;
         let num_rules = header.num_rules as usize;
-        let expected_rules_end = rules_offset
-            .checked_add(num_rules.checked_mul(PACKED_RULE_SIZE).ok_or_else(|| {
-                ButtlickError::CorruptedFormat("Rule table size overflow".into())
-            })?)
-            .ok_or_else(|| ButtlickError::CorruptedFormat("Rule offset overflow".into()))?;
+        let expected_rules_end =
+            rules_offset
+                .checked_add(num_rules.checked_mul(PACKED_RULE_SIZE).ok_or_else(|| {
+                    ButtlickError::CorruptedFormat("Rule table size overflow".into())
+                })?)
+                .ok_or_else(|| ButtlickError::CorruptedFormat("Rule offset overflow".into()))?;
 
         if roots_offset != BTLK_HEADER_SIZE
             || rules_offset < roots_offset
@@ -231,8 +232,10 @@ impl GrammarDag {
     /// Serializes this `GrammarDag` into a `.btlk` v1 byte vector in memory.
     pub fn to_btlk_bytes(&self) -> Vec<u8> {
         let roots_len: usize = self.roots.iter().map(|r| 32 + r.name.len()).sum();
-        let capacity =
-            BTLK_HEADER_SIZE + roots_len.next_multiple_of(8) + self.rules.len() * PACKED_RULE_SIZE + 8;
+        let capacity = BTLK_HEADER_SIZE
+            + roots_len.next_multiple_of(8)
+            + self.rules.len() * PACKED_RULE_SIZE
+            + 8;
         // Writing into a `Vec<u8>` is infallible.
         self.write_btlk(Vec::with_capacity(capacity))
             .expect("in-memory write cannot fail")

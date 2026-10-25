@@ -3,8 +3,8 @@ use std::time::Instant;
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::aggregate::{ eval_single_line, AggregateQuery, AggregateSummary };
-use crate::engine::kmp_seam::{ build_kmp_table, kmp_count };
+use crate::engine::aggregate::{eval_single_line, AggregateQuery, AggregateSummary};
+use crate::engine::kmp_seam::{build_kmp_table, kmp_count};
 use crate::engine::regex_compile::GrepMode;
 use crate::grammar::GrammarDag;
 

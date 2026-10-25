@@ -120,7 +120,10 @@ pub(crate) fn find_root_index(roots: &[RootEntry], doc_name: Option<&str>) -> Re
 
 /// Finds the root named `doc_name`, or the first root if `doc_name` is `None`.
 #[inline]
-pub(crate) fn find_root_in<'a>(roots: &'a [RootEntry], doc_name: Option<&str>) -> Result<&'a RootEntry> {
+pub(crate) fn find_root_in<'a>(
+    roots: &'a [RootEntry],
+    doc_name: Option<&str>,
+) -> Result<&'a RootEntry> {
     find_root_index(roots, doc_name).map(|idx| &roots[idx])
 }
 

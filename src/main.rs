@@ -428,8 +428,7 @@ fn run() -> Result<()> {
             while idx < total_files {
                 let batch_start = idx;
                 let mut batch_bytes = 0u64;
-                while idx < total_files
-                    && (batch_bytes < STREAM_BATCH_BYTES || idx == batch_start)
+                while idx < total_files && (batch_bytes < STREAM_BATCH_BYTES || idx == batch_start)
                 {
                     batch_bytes += file_list[idx].2;
                     idx += 1;
@@ -555,7 +554,10 @@ fn run() -> Result<()> {
             } else {
                 println!("Buttlick Archive (.btlk v1): {}", input.display());
                 println!("  Documents          : {}", rep.num_roots);
-                println!("  Total Uncompressed : {} bytes", rep.total_uncompressed_bytes);
+                println!(
+                    "  Total Uncompressed : {} bytes",
+                    rep.total_uncompressed_bytes
+                );
                 println!("  Archive Size       : {} bytes", rep.archive_bytes);
                 println!("  Compression Ratio  : {:.2}x", rep.compression_ratio);
                 println!(
@@ -757,11 +759,15 @@ fn run() -> Result<()> {
                 println!("SUM   : {}", res.sum);
                 println!(
                     "MIN   : {}",
-                    res.min.map(|v| v.to_string()).unwrap_or_else(|| "NULL".into())
+                    res.min
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "NULL".into())
                 );
                 println!(
                     "MAX   : {}",
-                    res.max.map(|v| v.to_string()).unwrap_or_else(|| "NULL".into())
+                    res.max
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "NULL".into())
                 );
                 println!(
                     "AVG   : {}",
@@ -805,26 +811,42 @@ fn run() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap());
             } else {
-                println!("=========================================================================");
+                println!(
+                    "========================================================================="
+                );
                 println!(" Buttlick Zero-Decompression Compute Benchmark ({size_mb} MB Dataset)");
-                println!("=========================================================================");
+                println!(
+                    "========================================================================="
+                );
                 println!("  Uncompressed Size : {} bytes", rep.uncompressed_bytes);
-                println!("  Compressed (.btlk): {} bytes ({:.2}x ratio)", rep.archive_bytes, rep.compression_ratio);
-                println!("  Grammar DAG Rules : {} rules (height {})", rep.num_rules, rep.dag_height);
+                println!(
+                    "  Compressed (.btlk): {} bytes ({:.2}x ratio)",
+                    rep.archive_bytes, rep.compression_ratio
+                );
+                println!(
+                    "  Grammar DAG Rules : {} rules (height {})",
+                    rep.num_rules, rep.dag_height
+                );
                 println!("  LCP Compress Time : {:.2} ms", rep.compress_ms);
-                println!("-------------------------------------------------------------------------");
+                println!(
+                    "-------------------------------------------------------------------------"
+                );
                 println!(
                     "  {:<46} | {:>10} | {:>10} | {:>8}",
                     "Operation", "Buttlick", "Raw Scan", "Speedup"
                 );
-                println!("-------------------------------------------------------------------------");
+                println!(
+                    "-------------------------------------------------------------------------"
+                );
                 for b in &rep.benchmarks {
                     println!(
                         "  {:<46} | {:>7} us | {:>7} us | {:>7.1}x",
                         b.operation, b.buttlick_us, b.raw_scan_us, b.speedup_x
                     );
                 }
-                println!("=========================================================================");
+                println!(
+                    "========================================================================="
+                );
             }
         }
     }

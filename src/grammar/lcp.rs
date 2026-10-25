@@ -5,7 +5,9 @@ use crate::error::Result;
 use crate::grammar::builder::{
     is_globally_interned_pair, RuleInterner, LINE_CACHE_MASK, SEEN_TABLE_MASK,
 };
-use crate::grammar::{repeat_tail, GrammarDag, RootEntry, RuleKind, RuleNode, SymbolId, MAX_RUN_COUNT};
+use crate::grammar::{
+    repeat_tail, GrammarDag, RootEntry, RuleKind, RuleNode, SymbolId, MAX_RUN_COUNT,
+};
 use crate::hash::{
     checksum64, combine_hashes, landmark_hash, mod_pow, raw_slice_hash, splitmix64_non_zero,
     HASH_BASE,
@@ -378,9 +380,8 @@ impl<'s> LocalChunkCompressor<'s> {
                         continue;
                     }
                 } else if b0 != b'\t' && (i + 1 < len && bytes[i + 1] != b0) {
-                    let is_punct = |b: u8| {
-                        b < 0x80 && b != b'\t' && !(b.is_ascii_alphanumeric() || b == b'_')
-                    };
+                    let is_punct =
+                        |b: u8| b < 0x80 && b != b'\t' && !(b.is_ascii_alphanumeric() || b == b'_');
                     if is_punct(b0) && (i == 0 || !is_punct(bytes[i - 1])) {
                         let max_end = (i + 9).min(len);
                         let mut j = i + 1;
@@ -416,17 +417,13 @@ impl<'s> LocalChunkCompressor<'s> {
                 && (bytes[i + 1] & 0xC0) == 0x80
                 && (bytes[i + 2] & 0xC0) == 0x80
             {
-                let p01 = self.intern_pair(
-                    SymbolId::from_byte(b0),
-                    SymbolId::from_byte(bytes[i + 1]),
-                );
+                let p01 =
+                    self.intern_pair(SymbolId::from_byte(b0), SymbolId::from_byte(bytes[i + 1]));
                 let s = self.intern_pair(p01, SymbolId::from_byte(bytes[i + 2]));
                 (s, 3usize)
             } else if i + 1 < len && (0xC2..=0xDF).contains(&b0) && (bytes[i + 1] & 0xC0) == 0x80 {
-                let s = self.intern_pair(
-                    SymbolId::from_byte(b0),
-                    SymbolId::from_byte(bytes[i + 1]),
-                );
+                let s =
+                    self.intern_pair(SymbolId::from_byte(b0), SymbolId::from_byte(bytes[i + 1]));
                 (s, 2usize)
             } else if i + 3 < len
                 && (0xF0..=0xF4).contains(&b0)
@@ -434,10 +431,8 @@ impl<'s> LocalChunkCompressor<'s> {
                 && (bytes[i + 2] & 0xC0) == 0x80
                 && (bytes[i + 3] & 0xC0) == 0x80
             {
-                let p01 = self.intern_pair(
-                    SymbolId::from_byte(b0),
-                    SymbolId::from_byte(bytes[i + 1]),
-                );
+                let p01 =
+                    self.intern_pair(SymbolId::from_byte(b0), SymbolId::from_byte(bytes[i + 1]));
                 let p23 = self.intern_pair(
                     SymbolId::from_byte(bytes[i + 2]),
                     SymbolId::from_byte(bytes[i + 3]),
@@ -858,9 +853,7 @@ fn split_into_line_units_cached<'a>(
             bounds.push(len);
             let parts: Vec<Vec<LineUnit<'a>>> = bounds
                 .par_windows(2)
-                .map(|w| {
-                    split_into_line_units_seq(&bytes[w[0]..w[1]], rules_ref, line_cache_ref)
-                })
+                .map(|w| split_into_line_units_seq(&bytes[w[0]..w[1]], rules_ref, line_cache_ref))
                 .collect();
             let total: usize = parts.iter().map(|p| p.len()).sum();
             let mut out = Vec::with_capacity(total);
@@ -1193,7 +1186,12 @@ impl GrammarDag {
                 .map(|&part| LocalChunkCompressor::compress_partition(part))
                 .collect();
             for local in &init_dags {
-                self.merge_seeded_partition_dag(local, 0, &mut remap_scratch, &mut unique_root_syms);
+                self.merge_seeded_partition_dag(
+                    local,
+                    0,
+                    &mut remap_scratch,
+                    &mut unique_root_syms,
+                );
             }
             self.interner.seed_rules_len = self.rules.len();
             &partitions[4..]
@@ -1452,10 +1450,11 @@ impl GrammarDag {
         let check_existing = self.roots.len() <= 64;
         self.roots.reserve(docs.len());
         let mut entries = Vec::with_capacity(docs.len());
-        for ((name, _), ((units, doc_kr_hash), root_symbol)) in docs
-            .iter()
-            .zip(doc_units_and_hashes.into_iter().zip(doc_root_syms.into_iter()))
-        {
+        for ((name, _), ((units, doc_kr_hash), root_symbol)) in docs.iter().zip(
+            doc_units_and_hashes
+                .into_iter()
+                .zip(doc_root_syms.into_iter()),
+        ) {
             drop(units);
             let byte_len = match root_symbol {
                 Some(sym) => self.sym_len(sym),
@@ -1486,11 +1485,10 @@ impl GrammarDag {
         } else {
             let n = &self.rules[sym.rule_index()];
             let tag = match n.kind {
-                RuleKind::Pair { left, right } => {
-                    (self.sym_len(left).rotate_left(13) ^ self.sym_len(right))
-                        .wrapping_add((self.sym_first_byte(left) as u64) << 8)
-                        .wrapping_add(self.sym_last_byte(right) as u64)
-                }
+                RuleKind::Pair { left, right } => (self.sym_len(left).rotate_left(13)
+                    ^ self.sym_len(right))
+                .wrapping_add((self.sym_first_byte(left) as u64) << 8)
+                .wrapping_add(self.sym_last_byte(right) as u64),
                 RuleKind::Run { child, count } => {
                     self.sym_len(child).rotate_left(29) ^ count.wrapping_mul(0xbf58476d1ce4e5b9)
                 }

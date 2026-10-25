@@ -69,7 +69,10 @@ fn test_100_sequential_random_dag_edits_vs_vec_oracle() {
 
                 let got_count = dag.replace_all(None, pat, repl).unwrap();
                 let (new_raw, expected_count) = brute_replace_all(&raw, pat, repl);
-                assert_eq!(got_count, expected_count, "replace_all count mismatch at step {step}");
+                assert_eq!(
+                    got_count, expected_count,
+                    "replace_all count mismatch at step {step}"
+                );
                 raw = new_raw;
             }
             _ => {
@@ -93,7 +96,10 @@ fn test_100_sequential_random_dag_edits_vs_vec_oracle() {
 
         // 2. Decompressed bytes must match the reference Vec<u8> bit-for-bit
         let decompressed = dag.decompress(None).unwrap();
-        assert_eq!(decompressed, raw, "Decompression mismatch after edit step {step}");
+        assert_eq!(
+            decompressed, raw,
+            "Decompression mismatch after edit step {step}"
+        );
 
         // 3. Queries on the edited DAG must return 100% exact results
         for probe in [&b"AA"[..], &b"PATCH"[..], &b"XYXY"[..]] {

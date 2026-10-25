@@ -251,8 +251,13 @@ pub(crate) trait RuleSource {
     fn rule_kind(&mut self, idx: usize) -> Result<RuleKind>;
     fn sym_len(&mut self, sym: SymbolId) -> Result<u64>;
     /// Appends bytes `[start, end)` of `sym`'s expansion to `out`.
-    fn append_range(&mut self, sym: SymbolId, start: u64, end: u64, out: &mut Vec<u8>)
-        -> Result<()>;
+    fn append_range(
+        &mut self,
+        sym: SymbolId,
+        start: u64,
+        end: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()>;
 }
 
 /// `RuleSource` over a fully decoded `GrammarDag`.
@@ -529,7 +534,13 @@ mod tests {
         let d4 = AffineDigitMonoid::from_digit(b'4');
         let d5 = AffineDigitMonoid::from_digit(b'5');
         let d45 = d4.combine(d5);
-        assert_eq!(d45, AffineDigitMonoid { value: 45, pow10: 100 });
+        assert_eq!(
+            d45,
+            AffineDigitMonoid {
+                value: 45,
+                pow10: 100
+            }
+        );
         let d145 = d1.combine(d45);
         assert_eq!(
             d145,

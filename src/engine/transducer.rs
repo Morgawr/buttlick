@@ -136,7 +136,9 @@ impl MealyTransducer {
                 RuleKind::Pair { left, right } => {
                     let l_has_emit = if let Some(b) = left.as_byte() {
                         let off = (b as usize) * s;
-                        scratch_a.next_state.copy_from_slice(&terminal_next[off..off + s]);
+                        scratch_a
+                            .next_state
+                            .copy_from_slice(&terminal_next[off..off + s]);
                         let em = &terminal_emit[off..off + s];
                         let has = em.iter().any(|&v| v != 0);
                         if has {
@@ -146,7 +148,9 @@ impl MealyTransducer {
                     } else {
                         let li = left.rule_index();
                         let off = li * s;
-                        scratch_a.next_state.copy_from_slice(&rule_next[off..off + s]);
+                        scratch_a
+                            .next_state
+                            .copy_from_slice(&rule_next[off..off + s]);
                         let em_off = rule_emit_offset[li];
                         if em_off != u32::MAX {
                             let eo = (em_off as usize) * s;
@@ -159,7 +163,9 @@ impl MealyTransducer {
 
                     let r_has_emit = if let Some(b) = right.as_byte() {
                         let off = (b as usize) * s;
-                        scratch_b.next_state.copy_from_slice(&terminal_next[off..off + s]);
+                        scratch_b
+                            .next_state
+                            .copy_from_slice(&terminal_next[off..off + s]);
                         let em = &terminal_emit[off..off + s];
                         let has = em.iter().any(|&v| v != 0);
                         if has {
@@ -169,7 +175,9 @@ impl MealyTransducer {
                     } else {
                         let ri = right.rule_index();
                         let off = ri * s;
-                        scratch_b.next_state.copy_from_slice(&rule_next[off..off + s]);
+                        scratch_b
+                            .next_state
+                            .copy_from_slice(&rule_next[off..off + s]);
                         let em_off = rule_emit_offset[ri];
                         if em_off != u32::MAX {
                             let eo = (em_off as usize) * s;
@@ -225,12 +233,18 @@ impl MealyTransducer {
                 RuleKind::Run { child, count } => {
                     if let Some(b) = child.as_byte() {
                         let off = (b as usize) * s;
-                        scratch_a.next_state.copy_from_slice(&terminal_next[off..off + s]);
-                        scratch_a.emit_sum.copy_from_slice(&terminal_emit[off..off + s]);
+                        scratch_a
+                            .next_state
+                            .copy_from_slice(&terminal_next[off..off + s]);
+                        scratch_a
+                            .emit_sum
+                            .copy_from_slice(&terminal_emit[off..off + s]);
                     } else {
                         let ci = child.rule_index();
                         let off = ci * s;
-                        scratch_a.next_state.copy_from_slice(&rule_next[off..off + s]);
+                        scratch_a
+                            .next_state
+                            .copy_from_slice(&rule_next[off..off + s]);
                         let em_off = rule_emit_offset[ci];
                         if em_off == u32::MAX {
                             scratch_a.emit_sum.fill(0);
@@ -240,8 +254,7 @@ impl MealyTransducer {
                         }
                     }
                     let pow = power_summary(&scratch_a, count);
-                    rule_next[out_next_start..out_next_start + s]
-                        .copy_from_slice(&pow.next_state);
+                    rule_next[out_next_start..out_next_start + s].copy_from_slice(&pow.next_state);
                     if pow.emit_sum.iter().any(|&v| v != 0) {
                         let pool_idx = (emit_pool.len() / s) as u32;
                         emit_pool.extend_from_slice(&pow.emit_sum);

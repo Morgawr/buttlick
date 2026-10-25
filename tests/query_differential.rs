@@ -61,7 +61,8 @@ fn test_differential_kmp_exact_search_and_offsets_500_cases() {
 
             let got_count = dag.count_literal(None, &pat).unwrap();
             assert_eq!(
-                got_count, expected_count,
+                got_count,
+                expected_count,
                 "Count mismatch on case {case}, pat={:?}",
                 String::from_utf8_lossy(&pat)
             );
@@ -69,7 +70,8 @@ fn test_differential_kmp_exact_search_and_offsets_500_cases() {
             let (got_count2, got_offsets) = dag.locate_literal(None, &pat, usize::MAX).unwrap();
             assert_eq!(got_count2, expected_count);
             assert_eq!(
-                got_offsets, expected_offsets,
+                got_offsets,
+                expected_offsets,
                 "Offsets mismatch on case {case}, pat={:?}",
                 String::from_utf8_lossy(&pat)
             );
@@ -133,7 +135,10 @@ fn test_differential_regex_grep_and_structured_analytics() {
                     .count() as u64
             };
             let got_lines = dag.grep(None, pat, GrepMode::LineCount).unwrap();
-            assert_eq!(got_lines, expected_lines, "LineCount mismatch on trial {trial}, pat={pat}");
+            assert_eq!(
+                got_lines, expected_lines,
+                "LineCount mismatch on trial {trial}, pat={pat}"
+            );
 
             let re_multi = RegexBuilder::new(pat).multi_line(true).build().unwrap();
             let expected_matches = re_multi.find_iter(&raw).count() as u64;

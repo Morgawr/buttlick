@@ -82,7 +82,11 @@ impl MappedArchive {
                 heights[sym.rule_index()]
             }
         };
-        for (idx, chunk) in self.rules_bytes().chunks_exact(PACKED_RULE_SIZE).enumerate() {
+        for (idx, chunk) in self
+            .rules_bytes()
+            .chunks_exact(PACKED_RULE_SIZE)
+            .enumerate()
+        {
             let p = PackedRuleNode::from_bytes(chunk.try_into().unwrap());
             let sym_id = SymbolId::from_rule_index(idx).0;
             heights[idx] = if p.is_run() {
@@ -214,7 +218,9 @@ mod tests {
             assert_eq!(count, v as u64);
         }
 
-        let grep_counts = dag.grep_all_docs("status=500$", GrepMode::LineCount).unwrap();
+        let grep_counts = dag
+            .grep_all_docs("status=500$", GrepMode::LineCount)
+            .unwrap();
         for (v, (_, count)) in grep_counts.into_iter().enumerate() {
             assert_eq!(count, v as u64);
         }
